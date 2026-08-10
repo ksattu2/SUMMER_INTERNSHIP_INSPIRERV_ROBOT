@@ -283,32 +283,19 @@ uint8_t normal_brightness_divisor = 10;// >0
 // ============================================================
 // >>> ADDED FOR ROBOT CAR MODE - START (CORRECTED) <<<
 // ============================================================
-//
-// FIX #1 (critical): the pin macros used to point at C6, C7, C0, D4 —
-// none of which matched the actual wiring, and PD4 in particular
-// collides with ADC_read()'s GPIO_Ain7_D4 channel in driver.h.
-// Real wiring is:
-//   L0 -> PA1   L1 -> PC5   R0 -> PC6   R1 -> PC7
-// Verified against driver.h: none of these four pins are used by any
-// ADC/button/joystick read in this codebase, so they're safe as plain
-// digital outputs.
-//
+// Motor pins: L0=PA1, L1=PC5, R0=PC6, R1=PC7
 #define MOTOR_R0  GPIOv_from_PORT_PIN(GPIO_port_C, 6) 
 #define MOTOR_R1  GPIOv_from_PORT_PIN(GPIO_port_C, 7) 
 #define MOTOR_L0  GPIOv_from_PORT_PIN(GPIO_port_C, 5)
 #define MOTOR_L1  GPIOv_from_PORT_PIN(GPIO_port_A, 1)
 
-// Software PWM period in microseconds. 1000us = 1kHz switching rate.
+// Software PWM period in microseconds
 #define MOTOR_PWM_PERIOD_US   1000
 
-// 0-100. This is the car's cruising speed. Change it with
-// robot_set_speed() from anywhere (a menu, a button, etc).
+// Current cruising speed (0-100)
 volatile uint8_t motor_speed_percent = 100;
 
 void robot_init(void) {
-    // FIX #2: GPIO_port_A must be enabled since L0 now lives on PA1.
-    // Port D is no longer touched by any motor pin, so it's dropped
-    // entirely (avoids fighting over PD4, which the ADC uses).
     GPIO_port_enable(GPIO_port_A);
     GPIO_port_enable(GPIO_port_C);
 
@@ -317,19 +304,14 @@ void robot_init(void) {
     GPIO_pinMode(MOTOR_R0, GPIO_pinMode_O_pushPull, GPIO_Speed_10MHz);
     GPIO_pinMode(MOTOR_R1, GPIO_pinMode_O_pushPull, GPIO_Speed_10MHz);
 
-    // Force both motors to a known stopped state (0,0) on entry.
+    // Start with motors off
     GPIO_digitalWrite_lo(MOTOR_L0);
     GPIO_digitalWrite_lo(MOTOR_L1);
     GPIO_digitalWrite_lo(MOTOR_R0);
     GPIO_digitalWrite_lo(MOTOR_R1);
 }
 
-// ------------------------------------------------------------------
-// STAGE 1 TEST: plain on/off control, no PWM. Drives each of the 4
-// pins high/low one at a time with console prints, so wiring and
-// motor direction can be confirmed with a multimeter or by watching
-// the wheels before trusting the PWM path.
-// ------------------------------------------------------------------
+// Simple on/off test of each motor pin, for checking wiring
 void robot_pin_test(void) {
     robot_init();
 
@@ -361,23 +343,8 @@ void robot_pin_test(void) {
 }
 
 /**
- * =====================================================================
- *  SECTION 1: CORE MOTOR SPEED CONTROL
- * =====================================================================
- * @brief One period of software PWM speed control for a single motor.
- *
- * For an L9110-style driver, speed control means PWM-ing whichever
- * pin is "active" for the chosen direction, while the OTHER pin of
- * that motor stays low the whole period:
- *   dir > 0  -> PWM on pin_a, pin_b held low   (forward)
- *   dir < 0  -> PWM on pin_b, pin_a held low   (reverse)
- *   dir == 0 -> both low                        (stop)
- * One call runs exactly one PWM period (MOTOR_PWM_PERIOD_US long).
- *
- * @param pin_a a GPIO pin wired to a single motor's driver channel
- * @param pin_b a GPIO pin wired to a single motor's driver channel
- * @param dir Signed value that picks which of the two pins gets the PWM signal
- * @param duty_percent Controls the average power/voltage sent to a motor (0-100)
+ * @brief One PWM period for a single motor.
+ * dir > 0 forward, dir < 0 reverse, dir == 0 stop.
  **/
 static inline void motor_pwm_step(uint32_t pin_a, uint32_t pin_b, int8_t dir, uint8_t duty_percent) {
     if (dir == 0) {
@@ -406,8 +373,7 @@ static inline void motor_pwm_step(uint32_t pin_a, uint32_t pin_b, int8_t dir, ui
     }
 }
 
-// Full-speed convenience wrappers, kept in case anything else calls
-// these directly. dir: 1 = forward, -1 = backward, 0 = stop
+// Full-speed motor control. dir: 1 = forward, -1 = backward, 0 = stop
 void motor_left(int8_t dir) {
     if (dir > 0)      { GPIO_digitalWrite_hi(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1); }
     else if (dir < 0) { GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_hi(MOTOR_L1); }
@@ -419,35 +385,21 @@ void motor_right(int8_t dir) {
     else              { GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1); }
 }
 
-/**
- * @brief Set the global cruising speed (0-100%) used by every movement
- * helper below (curve-to-stop, point turns, zero-turn arcs, and the
- * tap-based forward/back/left/right moves). Call this any time — from
- * a menu, a potentiometer read, another button, etc. — to change how
- * fast the car drives on its NEXT move.
- **/
+// Set cruising speed (0-100%) for the next move
 void robot_set_speed(uint8_t percent) {
     if (percent > 100) percent = 100;
     motor_speed_percent = percent;
 }
 
-/**
- * @brief FEATURE: Speed Control presets.
- * Three fixed speed levels the driver can step through with a single
- * button, instead of only ever driving at 100%.
- **/
-#define SPEED_LEVEL_LOW      40   // gentle, good for tight indoor spaces
-#define SPEED_LEVEL_MEDIUM   70   // everyday driving speed
-#define SPEED_LEVEL_HIGH     100  // full power
+// Speed presets
+#define SPEED_LEVEL_LOW      40
+#define SPEED_LEVEL_MEDIUM   70
+#define SPEED_LEVEL_HIGH     100
 
 static const uint8_t speed_presets[3] = { SPEED_LEVEL_LOW, SPEED_LEVEL_MEDIUM, SPEED_LEVEL_HIGH };
-static uint8_t speed_level = 2; // index into speed_presets[]; starts at HIGH (matches the old fixed 100% default)
+static uint8_t speed_level = 2; // index into speed_presets[]
 
-/**
- * @brief Quick visual readout of the speed level on the LED matrix,
- * since the car has no screen to print a number on: flashes teal
- * `times` times (1 flash = LOW, 2 = MEDIUM, 3 = HIGH).
- **/
+// Flash the LEDs to show current speed level (1/2/3 flashes)
 static void flash_speed_indicator(uint8_t times) {
     for (uint8_t i = 0; i < times; i++) {
         fill_color((color_t){.r = 0, .g = 60, .b = 60});
@@ -459,13 +411,7 @@ static void flash_speed_indicator(uint8_t times) {
     }
 }
 
-/**
- * @brief FEATURE: Speed Control.
- * Cycles LOW -> MEDIUM -> HIGH -> LOW ... every time it's called,
- * pushes the new value into robot_set_speed(), and flashes the LEDs
- * once per level (1/2/3 flashes) so the driver can see which speed
- * they just picked.
- **/
+// Cycle LOW -> MEDIUM -> HIGH -> LOW and flash LEDs to show the level
 void robot_cycle_speed(void) {
     speed_level = (speed_level + 1) % 3;
     robot_set_speed(speed_presets[speed_level]);
@@ -473,20 +419,8 @@ void robot_cycle_speed(void) {
     flash_speed_indicator(speed_level + 1);
 }
 
-/**
- * @brief Runs both motors at a fixed direction/speed for a fixed duration.
- * This is the shared low-level "drive for this long" building block that
- * every higher-level move (point turn, zero-turn arc, tap-forward, etc.)
- * below is built out of.
- *
- * @param dir_l          -1, 0, or 1 for the left wheel
- * @param dir_r          -1, 0, or 1 for the right wheel
- * @param speed_percent  duty cycle (0-100) applied to whichever wheel is moving
- * @param duration_ms    how long to hold this movement, in milliseconds
- **/
+// Drive both motors at a fixed direction/speed for a fixed duration
 static void run_timed_move(int8_t dir_l, int8_t dir_r, uint8_t speed_percent, uint16_t duration_ms) {
-    // Each pass below issues one PWM period on the left motor and one on
-    // the right motor, so one pass takes ~2 * MOTOR_PWM_PERIOD_US.
     uint32_t total_us    = (uint32_t)duration_ms * 1000UL;
     uint32_t us_per_pass = 2UL * MOTOR_PWM_PERIOD_US;
     uint32_t passes      = total_us / us_per_pass;
@@ -497,114 +431,63 @@ static void run_timed_move(int8_t dir_l, int8_t dir_r, uint8_t speed_percent, ui
     }
 }
 
-// ------------------------------------------------------------------
-// FIX: "kickstart" pulse for LOW / MEDIUM speed.
-//
-// Cheap DC gear motors need more torque to break static friction
-// (start moving from a dead stop) than they need to keep spinning
-// once already moving. At 40-70% duty the software PWM never gives
-// them enough average voltage to break that stiction, so the wheels
-// just hum without turning -- while 100% duty has enough kick to get
-// going. This briefly drives at full power for a short burst before
-// settling into the actual target speed, so LOW/MEDIUM can start
-// moving too.
-// ------------------------------------------------------------------
-#define MOTOR_KICKSTART_PERCENT      100  // power used for the kick pulse
-#define MOTOR_KICKSTART_MS           60   // how long the kick pulse lasts
-#define MOTOR_KICKSTART_MIN_TARGET   80   // only kick if target speed is below this
+// Brief full-power pulse so LOW/MEDIUM speed can actually start moving
+#define MOTOR_KICKSTART_PERCENT      100
+#define MOTOR_KICKSTART_MS           60
+#define MOTOR_KICKSTART_MIN_TARGET   80
 
 static void motor_kickstart(int8_t dir_l, int8_t dir_r, uint8_t target_speed_percent) {
-    if (target_speed_percent == 0) return;                       // not actually moving
-    if (target_speed_percent >= MOTOR_KICKSTART_MIN_TARGET) return; // already strong enough to self-start
+    if (target_speed_percent == 0) return;
+    if (target_speed_percent >= MOTOR_KICKSTART_MIN_TARGET) return;
     run_timed_move(dir_l, dir_r, MOTOR_KICKSTART_PERCENT, MOTOR_KICKSTART_MS);
 }
 
-// How much duty cycle (%) to shave off per deceleration step, and how
-// long to hold each step, while curving to a stop.
+// How fast/long to ramp down speed when stopping
 #define CURVE_STOP_STEP_PERCENT   5
 #define CURVE_STOP_STEP_MS        40
 
-/**
- * =====================================================================
- *  SECTION 2: MOVEMENT FEATURES
- * =====================================================================
- * @brief FEATURE: Curve to a Stop.
- * Instead of cutting the motors dead (which jolts the chassis and can
- * skid the wheels), this ramps the duty cycle down in small steps while
- * still driving in the same direction, so the robot glides to a smooth
- * halt instead of a sudden one.
- *
- * @param dir_l          direction the left wheel was moving (-1, 0, 1)
- * @param dir_r          direction the right wheel was moving (-1, 0, 1)
- * @param start_speed    duty cycle (0-100) the car was cruising at
- **/
+// Ramp speed down gradually instead of stopping instantly
 void curve_to_stop(int8_t dir_l, int8_t dir_r, uint8_t start_speed) {
     uint8_t speed = start_speed;
     while (speed > 0) {
         run_timed_move(dir_l, dir_r, speed, CURVE_STOP_STEP_MS);
         speed = (speed > CURVE_STOP_STEP_PERCENT) ? speed - CURVE_STOP_STEP_PERCENT : 0;
     }
-    // Final hard stop, both pins of both motors low.
     GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1);
     GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1);
 }
 
-/**
- * @brief FEATURE: Point Turn - Spin Clockwise.
- * Left wheel drives forward, right wheel drives backward at the same
- * speed, so the car rotates in place around its own center (zero net
- * forward travel), spinning clockwise.
- **/
+// Spin in place, clockwise
 void point_turn_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
     motor_kickstart(1, -1, speed_percent);
     run_timed_move(1, -1, speed_percent, duration_ms);
     curve_to_stop(1, -1, speed_percent);
 }
 
-/**
- * @brief FEATURE: Point Turn - Spin Counter-Clockwise.
- * Left wheel drives backward, right wheel drives forward at the same
- * speed — the mirror image of point_turn_clockwise().
- **/
+// Spin in place, counter-clockwise
 void point_turn_counter_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
     motor_kickstart(-1, 1, speed_percent);
     run_timed_move(-1, 1, speed_percent, duration_ms);
     curve_to_stop(-1, 1, speed_percent);
 }
 
-/**
- * @brief FEATURE: Zero-Turn Arc — pivot to the RIGHT.
- * The right wheel is held completely stopped (dir = 0) while the left
- * wheel drives forward, so the car pivots around the stationary right
- * wheel instead of spinning around its own center.
- **/
+// Pivot right around the stopped right wheel
 void zero_turn_arc_right(uint8_t speed_percent, uint16_t duration_ms) {
     motor_kickstart(1, 0, speed_percent);
     run_timed_move(1, 0, speed_percent, duration_ms);
     curve_to_stop(1, 0, speed_percent);
 }
 
-/**
- * @brief FEATURE: Zero-Turn Arc — pivot to the LEFT.
- * The left wheel is held completely stopped while the right wheel
- * drives forward, pivoting the car around the stationary left wheel.
- **/
+// Pivot left around the stopped left wheel
 void zero_turn_arc_left(uint8_t speed_percent, uint16_t duration_ms) {
     motor_kickstart(0, 1, speed_percent);
     run_timed_move(0, 1, speed_percent, duration_ms);
     curve_to_stop(0, 1, speed_percent);
 }
 
-/**
- * =====================================================================
- *  SECTION 3: TAP-COUNT BASED FORWARD / BACK / LEFT / RIGHT
- * =====================================================================
- * "Press the button once -> move for a short time and stop.
- *  Press the button twice in a row -> move for a longer time and stop."
- * This block gives every direction that same behavior.
- **/
-#define DOUBLE_TAP_WINDOW_MS   400   // max gap between taps to still count as "double"
-#define RELEASE_DEBOUNCE_MS    50    // settle time after a button is released
+// Tap once = short move, tap twice quickly = longer move
+#define DOUBLE_TAP_WINDOW_MS   400
+#define RELEASE_DEBOUNCE_MS    50
 
 typedef enum {
     TAP_NONE = 0,
@@ -612,17 +495,8 @@ typedef enum {
     TAP_DOUBLE
 } tap_result_t;
 
-/**
- * @brief Call this exactly when is_pressed() has just been seen true.
- * It waits for that first press to release, then watches for a short
- * window to see whether a SECOND press follows right away.
- *
- * @param is_pressed function pointer to one of the JOY_x_pressed() wrappers below
- * @return TAP_SINGLE if only one press happened, TAP_DOUBLE if a second
- *         press arrived within DOUBLE_TAP_WINDOW_MS
- **/
+// Watches for a second press right after the first to detect a double tap
 static tap_result_t detect_tap_pattern(uint8_t (*is_pressed)(void)) {
-    // Wait for the (already-detected) first press to be released.
     while (is_pressed()) {
         Delay_Ms(10);
     }
@@ -631,7 +505,6 @@ static tap_result_t detect_tap_pattern(uint8_t (*is_pressed)(void)) {
     uint16_t waited_ms = 0;
     while (waited_ms < DOUBLE_TAP_WINDOW_MS) {
         if (is_pressed()) {
-            // Second press arrived in time -> it's a double tap.
             while (is_pressed()) {
                 Delay_Ms(10);
             }
@@ -643,58 +516,31 @@ static tap_result_t detect_tap_pattern(uint8_t (*is_pressed)(void)) {
     return TAP_SINGLE;
 }
 
-// Tiny wrappers so the macros above can be passed around as function
-// pointers (JOY_x_pressed() is a macro, not a real function, so it
-// can't be taken by address on its own).
+// Wrappers so the JOY_x_pressed() macros can be used as function pointers
 static uint8_t joy2_pressed_fn(void) { return JOY_2_pressed(); }
 static uint8_t joy8_pressed_fn(void) { return JOY_8_pressed(); }
 static uint8_t joy4_pressed_fn(void) { return JOY_4_pressed(); }
 static uint8_t joy6_pressed_fn(void) { return JOY_6_pressed(); }
 
-// How long each kind of move runs for, in milliseconds. Tune these to
-// taste — bigger numbers = the car travels further per tap.
-#define TAP_MOVE_DURATION_MS    600    // single press -> short nudge
-#define HOLD_MOVE_DURATION_MS   2200   // double press ("press twice in a row") -> longer run
+// Move durations: single tap vs double tap
+#define TAP_MOVE_DURATION_MS    600
+#define HOLD_MOVE_DURATION_MS   2200
 
-/**
- * @brief Shared "press once = short move, press twice in a row = long
- * move" handler. Forward/back/left/right all call this with their own
- * wheel directions and their own button, so the timing logic lives in
- * exactly one place.
- *
- * @param dir_l, dir_r   wheel directions for this move (see run_timed_move)
- * @param is_pressed     function pointer used to detect the double tap
- **/
+// Shared handler for forward/back/left/right tap behavior
 static void handle_directional_tap(int8_t dir_l, int8_t dir_r, uint8_t (*is_pressed)(void)) {
     tap_result_t tap = detect_tap_pattern(is_pressed);
     uint16_t duration_ms = (tap == TAP_DOUBLE) ? HOLD_MOVE_DURATION_MS : TAP_MOVE_DURATION_MS;
 
     motor_kickstart(dir_l, dir_r, motor_speed_percent);
     run_timed_move(dir_l, dir_r, motor_speed_percent, duration_ms);
-    // Curve to a stop instead of an abrupt cutoff at the end of every move.
     curve_to_stop(dir_l, dir_r, motor_speed_percent);
 }
 
-/**
- * =====================================================================
- *  SECTION 4: MAIN ROBOT CAR LOOP — wires all the features above to buttons
- * =====================================================================
- * Button map used inside this routine:
- *   JOY_2 (up)    -> Forward   : tap = short move, double-tap = long move
- *   JOY_8 (down)  -> Backward  : tap = short move, double-tap = long move
- *   JOY_4 (left)  -> Point Turn Counter-Clockwise (tap/double-tap timed)
- *   JOY_6 (right) -> Point Turn Clockwise (tap/double-tap timed)
- *   JOY_1         -> Zero-Turn Arc, pivot LEFT  (right wheel stopped)
- *   JOY_7         -> Zero-Turn Arc, pivot RIGHT (left wheel stopped)
- *   JOY_5 (middle)-> Speed Control: cycles LOW -> MEDIUM -> HIGH -> LOW ...
- *   JOY_9         -> Exit robot car mode, back to paint app
- * Every move ends with curve_to_stop() so the car always glides to a
- * halt rather than slamming to a stop.
- **/
+// Main loop for driving the robot car with the joystick buttons
 void robot_car_routine(void) {
     robot_init();
 
-    // Delete the InspireRV logo in the beginning
+    // Clear the LED logo before driving
     for (int i = 0; i < NUM_LEDS; i++) {
         canvas[i].layer = CLEARROUND_LAYER;
         canvas[i].color = clearground;
@@ -702,38 +548,38 @@ void robot_car_routine(void) {
 
     while (1) {
         if (JOY_2_pressed()) {
-            // FORWARD
+            // Forward
             handle_directional_tap(1, 1, joy2_pressed_fn);
         }
         else if (JOY_8_pressed()) {
-            // BACKWARD
+            // Backward
             handle_directional_tap(-1, -1, joy8_pressed_fn);
         }
         else if (JOY_4_pressed()) {
-            // LEFT = Point Turn Counter-Clockwise
+            // Turn left
             handle_directional_tap(-1, 1, joy4_pressed_fn);
         }
         else if (JOY_6_pressed()) {
-            // RIGHT = Point Turn Clockwise
+            // Turn right
             handle_directional_tap(1, -1, joy6_pressed_fn);
         }
         else if (JOY_1_pressed()) {
-            // Zero-Turn Arc pivoting left (right wheel drives, left stopped)
+            // Pivot left
             zero_turn_arc_left(motor_speed_percent, TAP_MOVE_DURATION_MS);
         }
         else if (JOY_7_pressed()) {
-            // Zero-Turn Arc pivoting right (left wheel drives, right stopped)
+            // Pivot right
             zero_turn_arc_right(motor_speed_percent, TAP_MOVE_DURATION_MS);
         }
         else if (JOY_5_pressed()) {
-            // SPEED CONTROL: one press = step to the next speed level.
+            // Cycle speed
             robot_cycle_speed();
-            // Wait for release so a single press doesn't cycle repeatedly.
             while (JOY_5_pressed()) {
                 Delay_Ms(10);
             }
         }
         else if (JOY_9_pressed()) {
+            // Exit to paint app
             appChosen = rv_paint;
             break;
         }
@@ -741,15 +587,14 @@ void robot_car_routine(void) {
         Delay_Ms(20);
     }
 
-    // Motors off on exit.
+    // Motors off on exit
     GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1);
     GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1);
 
     Delay_Us(200);
 }
 
-// Checks how long button 9 is held.
-// Returns: 0 = not pressed, 1 = short tap, 2 = long hold (1.5+ sec)
+// Checks how long JOY_9 is held: 0 = not pressed, 1 = short tap, 2 = long hold (1.5s+)
 uint8_t check_JOY9_hold(void) {
     if (!JOY_9_pressed()) return 0;
     uint16_t held_ms = 0;
@@ -759,7 +604,6 @@ uint8_t check_JOY9_hold(void) {
     }
     return (held_ms >= 1500) ? 2 : 1;
 }
-
 // ============================================================
 // >>> ADDED FOR ROBOT CAR MODE - END <<<
 // ============================================================
