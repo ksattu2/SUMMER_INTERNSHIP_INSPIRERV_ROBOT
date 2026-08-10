@@ -497,6 +497,28 @@ static void run_timed_move(int8_t dir_l, int8_t dir_r, uint8_t speed_percent, ui
     }
 }
 
+// ------------------------------------------------------------------
+// FIX: "kickstart" pulse for LOW / MEDIUM speed.
+//
+// Cheap DC gear motors need more torque to break static friction
+// (start moving from a dead stop) than they need to keep spinning
+// once already moving. At 40-70% duty the software PWM never gives
+// them enough average voltage to break that stiction, so the wheels
+// just hum without turning -- while 100% duty has enough kick to get
+// going. This briefly drives at full power for a short burst before
+// settling into the actual target speed, so LOW/MEDIUM can start
+// moving too.
+// ------------------------------------------------------------------
+#define MOTOR_KICKSTART_PERCENT      100  // power used for the kick pulse
+#define MOTOR_KICKSTART_MS           60   // how long the kick pulse lasts
+#define MOTOR_KICKSTART_MIN_TARGET   80   // only kick if target speed is below this
+
+static void motor_kickstart(int8_t dir_l, int8_t dir_r, uint8_t target_speed_percent) {
+    if (target_speed_percent == 0) return;                       // not actually moving
+    if (target_speed_percent >= MOTOR_KICKSTART_MIN_TARGET) return; // already strong enough to self-start
+    run_timed_move(dir_l, dir_r, MOTOR_KICKSTART_PERCENT, MOTOR_KICKSTART_MS);
+}
+
 // How much duty cycle (%) to shave off per deceleration step, and how
 // long to hold each step, while curving to a stop.
 #define CURVE_STOP_STEP_PERCENT   5
@@ -534,6 +556,7 @@ void curve_to_stop(int8_t dir_l, int8_t dir_r, uint8_t start_speed) {
  * forward travel), spinning clockwise.
  **/
 void point_turn_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
+    motor_kickstart(1, -1, speed_percent);
     run_timed_move(1, -1, speed_percent, duration_ms);
     curve_to_stop(1, -1, speed_percent);
 }
@@ -544,6 +567,7 @@ void point_turn_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
  * speed — the mirror image of point_turn_clockwise().
  **/
 void point_turn_counter_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
+    motor_kickstart(-1, 1, speed_percent);
     run_timed_move(-1, 1, speed_percent, duration_ms);
     curve_to_stop(-1, 1, speed_percent);
 }
@@ -555,6 +579,7 @@ void point_turn_counter_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
  * wheel instead of spinning around its own center.
  **/
 void zero_turn_arc_right(uint8_t speed_percent, uint16_t duration_ms) {
+    motor_kickstart(1, 0, speed_percent);
     run_timed_move(1, 0, speed_percent, duration_ms);
     curve_to_stop(1, 0, speed_percent);
 }
@@ -565,6 +590,7 @@ void zero_turn_arc_right(uint8_t speed_percent, uint16_t duration_ms) {
  * drives forward, pivoting the car around the stationary left wheel.
  **/
 void zero_turn_arc_left(uint8_t speed_percent, uint16_t duration_ms) {
+    motor_kickstart(0, 1, speed_percent);
     run_timed_move(0, 1, speed_percent, duration_ms);
     curve_to_stop(0, 1, speed_percent);
 }
@@ -643,6 +669,7 @@ static void handle_directional_tap(int8_t dir_l, int8_t dir_r, uint8_t (*is_pres
     tap_result_t tap = detect_tap_pattern(is_pressed);
     uint16_t duration_ms = (tap == TAP_DOUBLE) ? HOLD_MOVE_DURATION_MS : TAP_MOVE_DURATION_MS;
 
+    motor_kickstart(dir_l, dir_r, motor_speed_percent);
     run_timed_move(dir_l, dir_r, motor_speed_percent, duration_ms);
     // Curve to a stop instead of an abrupt cutoff at the end of every move.
     curve_to_stop(dir_l, dir_r, motor_speed_percent);
