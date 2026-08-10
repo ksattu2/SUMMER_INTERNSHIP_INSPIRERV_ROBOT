@@ -604,6 +604,15 @@ uint8_t check_JOY9_hold(void) {
     }
     return (held_ms >= 1500) ? 2 : 1;
 }
+// Button map once inside Robot Car mode:
+//   JOY_2 (up)    -> Forward, tap = short move, double-tap = long move
+//   JOY_8 (down)  -> Backward, tap = short move, double-tap = long move
+//   JOY_4 (left)  -> Turn left (spin in place)
+//   JOY_6 (right) -> Turn right (spin in place)
+//   JOY_1         -> Pivot left (right wheel stays still)
+//   JOY_7         -> Pivot right (left wheel stays still)
+//   JOY_5         -> Cycle speed: LOW -> MEDIUM -> HIGH -> LOW
+//   JOY_9         -> Exit robot car mode, back to paint app
 // ============================================================
 // >>> ADDED FOR ROBOT CAR MODE - END <<<
 // ============================================================
