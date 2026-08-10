@@ -1,0 +1,2405 @@
+#define CH32V003_I2C_IMPLEMENTATION
+#define WS2812BSIMPLE_IMPLEMENTATION
+#include <stdbool.h>
+#include "funconfig.h"
+#include "./ch32v003fun/ch32v003_i2c.h"
+#include "./data/colors.h"
+#include "./ch32v003fun/driver.h"
+//#include "./data/fonts.h"
+#include "./data/music.h"
+#include "./ch32v003fun/ws2812b_simple.h"
+// #ifdef abs
+// #undef abs
+// #endif
+#include "./ch32v003fun/ch32v003fun.h"
+#include "./hardware_binary_game/binary_game.h"
+
+//Storage defines
+#define EEPROM_ADDR 0x53 // obtained from i2c_scan(), before shifting by 1 bit
+#define page_size 64    // range of byte that stores status of page[x]
+#define opcode_size 28    // range of byte that stores opcodes
+#define NUM_LEDS 64
+#define init_status_addr_begin 0
+#define init_status_addr_end 7
+#define init_status_reg_size (init_status_addr_end - init_status_addr_begin + 1) // size  = 8
+#define init_status_format "  %c "
+#define init_status_data (uint8_t *)"IL000001"
+#define page_status_addr_begin 8 // page 8
+#define page_status_addr_end 511 // page 511
+#define page_status_reg_size (page_status_addr_end - page_status_addr_begin + 1) // page size = 504
+#define paint_addr_begin 8 //paint page start at 8
+#define sizeof_paint_data (3 * NUM_LEDS) //paint page size = 192
+#define sizeof_paint_data_aspage (sizeof_paint_data / page_size) // no. of paint page = 3
+#define paint_addr_end (paint_addr_begin + 8 * sizeof_paint_data_aspage - 1) // paint page end at addr = 31
+#define paint_page_no (0 * sizeof_paint_data_aspage) //no = 0
+#define paint_page_no_max (8 * sizeof_paint_data_aspage) //size = 24
+#define num_paint_saves (paint_page_no_max / sizeof_paint_data_aspage) //size = 8
+#define opcode_addr_begin (paint_addr_end + paint_page_no_max - 1) //addr = 54
+#define sizeof_opcode_data 64 //size = 64
+#define sizeof_opcode_data_aspage (sizeof_opcode_data / page_size) // size = 1
+#define opcode_addr_end (opcode_addr_begin + 8 * sizeof_paint_data_aspage - 1) //addr = 61
+#define opcode_page_no (0 * sizeof_opcode_data_aspage) //no = 8
+#define opcode_page_no_max (8 * sizeof_opcode_data_aspage) //size = 8
+#define matrix_hori 16
+#define app_icon_page_no (0 * sizeof_paint_data_aspage) //no = 0
+#define app_icon_page_no_max (8 * sizeof_paint_data_aspage) //size = 24
+
+
+#define delay 1000
+
+// Ensure HSI value has been defined
+#ifndef HSI_VALUE
+#define HSI_VALUE 24000000
+#endif
+
+/// @brief Initialize file storage structure for 32kb/512pages. First 8 pages are used for status.
+void init_storage(void);
+
+/// @brief Save paint data to eeprom, paint 0 stored in page ?? (out of page 0 to 511)
+void save_paint(uint16_t paint_no, color_t * data, uint8_t is_icon);    
+void load_paint(uint16_t paint_no, color_t * data, uint8_t is_icon);    // load paint data from eeprom, paint 0 stored in page ?? (out of page 0 to 511)
+/** 
+ * 
+ * 
+ **/
+void set_page_status(uint16_t page_no, uint8_t status); 
+/// @brief Reset to default storage status
+void reset_storage(void);   
+/// @brief Reads back and prints the current EEPROM status to console
+void print_status_storage(void);    
+
+uint8_t is_page_used(uint16_t page_no); // check if page[x] is already used
+
+/** 
+ * @brief Checks whether a block of data stored in EEPROM matches an expected “initialization signature.”
+ * It check if already initialized data, i.e., init_status_data is set.
+ * @return If every bit matches, it returns `1`; Otherwise, it is 0
+ **/
+uint8_t is_storage_initialized(void);   
+// save opcode data to eeprom, paint 0 stored in page ?? (out of page 0 to 511)
+void save_opCode(uint16_t opcode_no, uint8_t * data);
+void load_opCode(uint16_t opcode_no, uint8_t * data);
+
+
+uint16_t calculate_page_no(uint16_t paint_no, uint8_t is_icon);
+void any_paint_exist(uint8_t * paint_exist);
+void any_opcode_exist(uint8_t * opcode_exist);
+void erase_all_paint_saves(void);
+
+//App selection
+void appRunningRoutine(void);
+/** @brief Numbers are arranged by the order of icons
+ * in the EEPROM!!!!! Read app_selection() for more info.
+ */
+typedef enum _app_selected {
+    paint = 0,
+    music = 1,       // not implemented
+    rec = 2,         // not implemented
+    risc_v_code = 3, // not implemented
+    game_tic_tac_toe = 4,
+    game_snake = 5,
+    robot_car = 6,
+    rv_code = 7,
+	rv_music = 8,
+    rv_paint = 9
+} app_selected;
+
+// app_selected appChosen = rv_paint;
+// TO BE DELETED BELOW
+app_selected appChosen = robot_car;
+
+//RV Paints defines
+void painting_routine(void);
+void iconShow(void);
+//void display_stored_paints(void);
+
+void choose_save_page(app_selected app_current);
+void choose_load_page(app_selected app_current);
+void led_display_paint_page_status(app_selected app_current);
+
+// RV Code defines
+/******************************************/
+/*InspireRV Commands
+Coding Mode
+Function: 5bits  value: 3bits
+
+Drawing 0b00
+00 000 xxx | Fill Screen - xxx:RGB ~ Clear(000)
+00 001 00x | Hide/Show(x:0/x:1) Cursor
+00 010 xxx | Draw(Pen down) with color - xxx:RGB, xxx:000(Pen Up)
+00 011 xxx | Not yet
+00 100 xxx | Sound Freq
+00 101 xxx | Sound dur
+00 110 xxx | Set Program simulation speed - xxx:(0~7) ~ default 4
+00 111 xxx | Move Cursor to 0:home position, 1~4: four corners, 7: variable position
+
+Moving 0b01
+01 000 xxx | move north xxx:(0~7) steps
+01 001 xxx | move ne    xxx:(0~7) steps
+01 010 xxx | move east  xxx:(0~7) steps
+01 011 xxx | move se    xxx:(0~7) steps
+01 100 xxx | move south xxx:(0~7) steps
+01 101 xxx | move sw    xxx:(0~7) steps
+01 110 xxx | move west  xxx:(0~7) steps
+01 111 xxx | move nw    xxx:(0~7) steps
+
+Options 0b10
+10 000 000 | End of Program, codes after will not be run
+10 001 xxx | Jump to line xxx:(0~7) at Page 1
+10 010 xxx | Jump to line xxx:(0~7) at Page 2
+10 011 xxx | Jump to line xxx:(0~7) at Page 3
+10 100 xxx | Jump to line xxx:(0~7) at Page 4
+10 101 xxx | Load saved Program (0~7)
+10 110 xxx | Load saved Music (0~7)
+10 111 xxx | Load saved Drawing (0~7)
+
+loop variables 0b11
+11 000 xxx | skipifCarry(minus), decrease with xxx:(0~7) until < 0
+11 001 xxx | set blue color variable level xxx:(0~7) - dark 0, bright 7
+11 010 xxx | set greencolor variable level xxx:(0~7) - dark 0, bright 7
+11 011 xxx | set y variable coord xxx:(0~7) - xy-coord for 8x8
+11 100 xxx | set red color variable level xxx:(0~7) - dark 0, bright 7
+11 101 xxx | set x variable coord xxx:(0~7) - xy-coord for 8x8
+11 110 xxx | set looping variable xxx:(0~7), only for looping
+11 111 xxx | skipifCarry(plus), increase with xxx:(0~7) until > 7
+
+1: Load
+3: save
+4: Programming space
+5: Result
+6: Run step by step
+9: Register a color in a color Panel
+
+8-line: Page0, Page1, Page2, Page3, Current Pen Color
+green: head
+blue: tail
+//////////////////////////////////////////*/
+/******************************************/
+
+#define _OPCODE_PEN                 0b00
+#define _RVCODE_OPCODE_CLRSCREEN    0b00000
+#define _RVCODE_OPCODE_TURT         0b00001
+#define _RVCODE_OPCODE_PENRGB       0b00010
+#define _RVCODE_OPCODE_SOUNDFREQ    0b00100
+#define _RVCODE_OPCODE_SOUNDDUR     0b00101
+#define _RVCODE_OPCODE_PROSPEED     0b00110
+#define _RVCODE_OPCODE_TURT_POS     0b00111
+#define _OPCODE_MOVE                0b01
+#define _RVCODE_OPCODE_FD0          0b01000
+#define _RVCODE_OPCODE_FD45         0b01001
+#define _RVCODE_OPCODE_FD90         0b01010
+#define _RVCODE_OPCODE_FD135        0b01011
+#define _RVCODE_OPCODE_FD180        0b01100
+#define _RVCODE_OPCODE_FD225        0b01101
+#define _RVCODE_OPCODE_FD270        0b01110
+#define _RVCODE_OPCODE_FD315        0b01111
+#define _OPCODE_OPTION              0b10
+#define _RVCODE_OPCODE_JUMPP1       0b10001
+#define _RVCODE_OPCODE_JUMPP2       0b10010
+#define _RVCODE_OPCODE_JUMPP3       0b10011
+#define _RVCODE_OPCODE_JUMPP4       0b10100
+#define _RVCODE_OPCODE_LOADCODE     0b10101
+#define _RVCODE_OPCODE_LOADMUSIC    0b10110
+#define _RVCODE_OPCODE_LOADPAINT    0b10111
+#define _RVCODE_OPCODE_END          0b10000
+#define _OPCODE_VARLOOP             0b11
+#define _RVCODE_OPCODE_MINUSSKIP    0b11000
+#define _RVCODE_OPCODE_LOOPVAR      0b11101
+#define _RVCODE_OPCODE_ADDSKIP      0b11111
+#define _RVCODE_OPCODE_RVAR         0b11100
+#define _RVCODE_OPCODE_GVAR         0b11010
+#define _RVCODE_OPCODE_BVAR         0b11001
+#define _RVCODE_OPCODE_XVAR         0b11110
+#define _RVCODE_OPCODE_YVAR         0b11011
+
+#define _DIR_FD0                    8
+#define _DIR_FD45                   7
+#define _DIR_FD90                   -1
+#define _DIR_FD135                  -9
+#define _DIR_FD180                  -8
+#define _DIR_FD225                  -7
+#define _DIR_FD270                  1
+#define _DIR_FD315                  9
+#define _DIR_STOP                   0
+#define _TOTAL_CODE_LINE            28
+
+void rv_code_routine(void);
+void rvCodeRun(uint8_t direct_result);
+uint8_t opGroupExtraction(uint8_t received_message[8]);
+uint8_t opCodeExtraction(uint8_t received_message[8]);
+uint8_t varExtraction(uint8_t received_message[8]);
+void toCodingSpace(uint8_t curr_page);
+static void updatePendownColorFromBits(uint8_t bits, uint8_t rVariable, uint8_t gVariable, uint8_t bVariable);
+static const uint32_t timeout_flash = 200;
+uint32_t timeout_var_code = 150;
+uint32_t timeout_line_code = 300;
+uint8_t funcRun[8] = {0};
+uint8_t numRun[8] = {0};
+uint8_t programStored[64] = {0};
+uint8_t opCodeStorage[4][7][8] = {0};
+uint8_t opCodeToStored[28] ={0};
+uint8_t currentPage = 1;
+typedef struct rvCodeParts {
+    char part;
+    color_t current_color;
+} rvCodeParts;
+rvCodeParts rv_coding_board[64]={'0'}; // 8x8 gameboard
+int8_t pointerLocation = 36;
+
+// Color defines
+// Put it in the header file
+// void flushCanvas(void);
+// void displayColorPalette(void);
+void colorPaletteSelection(color_t * selectedColor);
+void logoDisplay(void);
+void red_screen(void);
+void bucketFill(void);
+void choose_led_brightness(void);
+void led_display_brightness_status(void);
+
+typedef struct {
+    enum { FOREGROUND_LAYER, BACKGROUND_LAYER, CLEARROUND_LAYER, PAGEGROUND_LAYER } layer;
+    color_t color;
+} canvas_t;
+canvas_t canvas[NUM_LEDS] = {0};
+
+static const color_t color_savefile_exist = {.r = 0, .g = 0, .b = 100};
+static const color_t color_savefile_empty = {.r = 0, .g = 100, .b = 0};
+static const color_t opcodeColor = {100, 0, 0};
+static const color_t valueColor = {0, 0, 100};
+color_t foreground = {100, 0, 0};
+color_t background = {0, 0, 100};
+// color_t pointground = {100, 100, 100};
+static const color_t clearground = {0, 0, 0};
+static const color_t pageground = {0, 10, 0};
+color_t rvPointerColor = {.r = 150, .g = 150, .b = 150};
+color_t rvPendownColor = {.r = 255, .g = 0, .b = 0};
+static const color_t rvClearColor = {.r = 0, .g = 0, .b = 0};
+
+uint8_t brightness_divisor = 10;// >0
+uint8_t normal_brightness_divisor = 10;// >0
+#define LED_PINS GPIOA, 2
+
+// ============================================================
+// >>> ADDED FOR ROBOT CAR MODE - START (CORRECTED) <<<
+// ============================================================
+//
+// FIX #1 (critical): the pin macros used to point at C6, C7, C0, D4 —
+// none of which matched the actual wiring, and PD4 in particular
+// collides with ADC_read()'s GPIO_Ain7_D4 channel in driver.h.
+// Real wiring is:
+//   L0 -> PA1   L1 -> PC5   R0 -> PC6   R1 -> PC7
+// Verified against driver.h: none of these four pins are used by any
+// ADC/button/joystick read in this codebase, so they're safe as plain
+// digital outputs.
+//
+#define MOTOR_R0  GPIOv_from_PORT_PIN(GPIO_port_C, 6) 
+#define MOTOR_R1  GPIOv_from_PORT_PIN(GPIO_port_C, 7) 
+#define MOTOR_L0  GPIOv_from_PORT_PIN(GPIO_port_C, 5)
+#define MOTOR_L1  GPIOv_from_PORT_PIN(GPIO_port_A, 1)
+
+// Software PWM period in microseconds. 1000us = 1kHz switching rate.
+#define MOTOR_PWM_PERIOD_US   1000
+
+// 0-100. This is the car's cruising speed. Change it with
+// robot_set_speed() from anywhere (a menu, a button, etc).
+volatile uint8_t motor_speed_percent = 100;
+
+void robot_init(void) {
+    // FIX #2: GPIO_port_A must be enabled since L0 now lives on PA1.
+    // Port D is no longer touched by any motor pin, so it's dropped
+    // entirely (avoids fighting over PD4, which the ADC uses).
+    GPIO_port_enable(GPIO_port_A);
+    GPIO_port_enable(GPIO_port_C);
+
+    GPIO_pinMode(MOTOR_L0, GPIO_pinMode_O_pushPull, GPIO_Speed_10MHz);
+    GPIO_pinMode(MOTOR_L1, GPIO_pinMode_O_pushPull, GPIO_Speed_10MHz);
+    GPIO_pinMode(MOTOR_R0, GPIO_pinMode_O_pushPull, GPIO_Speed_10MHz);
+    GPIO_pinMode(MOTOR_R1, GPIO_pinMode_O_pushPull, GPIO_Speed_10MHz);
+
+    // Force both motors to a known stopped state (0,0) on entry.
+    GPIO_digitalWrite_lo(MOTOR_L0);
+    GPIO_digitalWrite_lo(MOTOR_L1);
+    GPIO_digitalWrite_lo(MOTOR_R0);
+    GPIO_digitalWrite_lo(MOTOR_R1);
+}
+
+// ------------------------------------------------------------------
+// STAGE 1 TEST: plain on/off control, no PWM. Drives each of the 4
+// pins high/low one at a time with console prints, so wiring and
+// motor direction can be confirmed with a multimeter or by watching
+// the wheels before trusting the PWM path.
+// ------------------------------------------------------------------
+void robot_pin_test(void) {
+    robot_init();
+
+    printf("TEST: Left motor forward (L0=1, L1=0)\n");
+    GPIO_digitalWrite_hi(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1);
+    Delay_Ms(1000);
+
+    printf("TEST: Left motor reverse (L0=0, L1=1)\n");
+    GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_hi(MOTOR_L1);
+    Delay_Ms(1000);
+
+    printf("TEST: Left motor stop (L0=0, L1=0)\n");
+    GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1);
+    Delay_Ms(500);
+
+    printf("TEST: Right motor forward (R0=1, R1=0)\n");
+    GPIO_digitalWrite_hi(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1);
+    Delay_Ms(1000);
+
+    printf("TEST: Right motor reverse (R0=0, R1=1)\n");
+    GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_hi(MOTOR_R1);
+    Delay_Ms(1000);
+
+    printf("TEST: Right motor stop (R0=0, R1=0)\n");
+    GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1);
+    Delay_Ms(500);
+
+    printf("Pin test done.\n");
+}
+
+/**
+ * =====================================================================
+ *  SECTION 1: CORE MOTOR SPEED CONTROL
+ * =====================================================================
+ * @brief One period of software PWM speed control for a single motor.
+ *
+ * For an L9110-style driver, speed control means PWM-ing whichever
+ * pin is "active" for the chosen direction, while the OTHER pin of
+ * that motor stays low the whole period:
+ *   dir > 0  -> PWM on pin_a, pin_b held low   (forward)
+ *   dir < 0  -> PWM on pin_b, pin_a held low   (reverse)
+ *   dir == 0 -> both low                        (stop)
+ * One call runs exactly one PWM period (MOTOR_PWM_PERIOD_US long).
+ *
+ * @param pin_a a GPIO pin wired to a single motor's driver channel
+ * @param pin_b a GPIO pin wired to a single motor's driver channel
+ * @param dir Signed value that picks which of the two pins gets the PWM signal
+ * @param duty_percent Controls the average power/voltage sent to a motor (0-100)
+ **/
+static inline void motor_pwm_step(uint32_t pin_a, uint32_t pin_b, int8_t dir, uint8_t duty_percent) {
+    if (dir == 0) {
+        GPIO_digitalWrite_lo(pin_a);
+        GPIO_digitalWrite_lo(pin_b);
+        Delay_Us(MOTOR_PWM_PERIOD_US);
+        return;
+    }
+
+    if (duty_percent > 100) duty_percent = 100;
+    uint32_t on_us  = (MOTOR_PWM_PERIOD_US * (uint32_t)duty_percent) / 100;
+    uint32_t off_us = MOTOR_PWM_PERIOD_US - on_us;
+
+    uint32_t active_pin = (dir > 0) ? pin_a : pin_b;
+    uint32_t idle_pin   = (dir > 0) ? pin_b : pin_a;
+
+    GPIO_digitalWrite_lo(idle_pin);
+
+    if (on_us) {
+        GPIO_digitalWrite_hi(active_pin);
+        Delay_Us(on_us);
+    }
+    GPIO_digitalWrite_lo(active_pin);
+    if (off_us) {
+        Delay_Us(off_us);
+    }
+}
+
+// Full-speed convenience wrappers, kept in case anything else calls
+// these directly. dir: 1 = forward, -1 = backward, 0 = stop
+void motor_left(int8_t dir) {
+    if (dir > 0)      { GPIO_digitalWrite_hi(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1); }
+    else if (dir < 0) { GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_hi(MOTOR_L1); }
+    else              { GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1); }
+}
+void motor_right(int8_t dir) {
+    if (dir > 0)      { GPIO_digitalWrite_hi(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1); }
+    else if (dir < 0) { GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_hi(MOTOR_R1); }
+    else              { GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1); }
+}
+
+/**
+ * @brief Set the global cruising speed (0-100%) used by every movement
+ * helper below (curve-to-stop, point turns, zero-turn arcs, and the
+ * tap-based forward/back/left/right moves). Call this any time — from
+ * a menu, a potentiometer read, another button, etc. — to change how
+ * fast the car drives on its NEXT move.
+ **/
+void robot_set_speed(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    motor_speed_percent = percent;
+}
+
+/**
+ * @brief FEATURE: Speed Control presets.
+ * Three fixed speed levels the driver can step through with a single
+ * button, instead of only ever driving at 100%.
+ **/
+#define SPEED_LEVEL_LOW      40   // gentle, good for tight indoor spaces
+#define SPEED_LEVEL_MEDIUM   70   // everyday driving speed
+#define SPEED_LEVEL_HIGH     100  // full power
+
+static const uint8_t speed_presets[3] = { SPEED_LEVEL_LOW, SPEED_LEVEL_MEDIUM, SPEED_LEVEL_HIGH };
+static uint8_t speed_level = 2; // index into speed_presets[]; starts at HIGH (matches the old fixed 100% default)
+
+/**
+ * @brief Quick visual readout of the speed level on the LED matrix,
+ * since the car has no screen to print a number on: flashes teal
+ * `times` times (1 flash = LOW, 2 = MEDIUM, 3 = HIGH).
+ **/
+static void flash_speed_indicator(uint8_t times) {
+    for (uint8_t i = 0; i < times; i++) {
+        fill_color((color_t){.r = 0, .g = 60, .b = 60});
+        WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+        Delay_Ms(120);
+        clear();
+        WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+        Delay_Ms(120);
+    }
+}
+
+/**
+ * @brief FEATURE: Speed Control.
+ * Cycles LOW -> MEDIUM -> HIGH -> LOW ... every time it's called,
+ * pushes the new value into robot_set_speed(), and flashes the LEDs
+ * once per level (1/2/3 flashes) so the driver can see which speed
+ * they just picked.
+ **/
+void robot_cycle_speed(void) {
+    speed_level = (speed_level + 1) % 3;
+    robot_set_speed(speed_presets[speed_level]);
+    printf("Speed level: %d (%d%%)\n", speed_level + 1, speed_presets[speed_level]);
+    flash_speed_indicator(speed_level + 1);
+}
+
+/**
+ * @brief Runs both motors at a fixed direction/speed for a fixed duration.
+ * This is the shared low-level "drive for this long" building block that
+ * every higher-level move (point turn, zero-turn arc, tap-forward, etc.)
+ * below is built out of.
+ *
+ * @param dir_l          -1, 0, or 1 for the left wheel
+ * @param dir_r          -1, 0, or 1 for the right wheel
+ * @param speed_percent  duty cycle (0-100) applied to whichever wheel is moving
+ * @param duration_ms    how long to hold this movement, in milliseconds
+ **/
+static void run_timed_move(int8_t dir_l, int8_t dir_r, uint8_t speed_percent, uint16_t duration_ms) {
+    // Each pass below issues one PWM period on the left motor and one on
+    // the right motor, so one pass takes ~2 * MOTOR_PWM_PERIOD_US.
+    uint32_t total_us    = (uint32_t)duration_ms * 1000UL;
+    uint32_t us_per_pass = 2UL * MOTOR_PWM_PERIOD_US;
+    uint32_t passes      = total_us / us_per_pass;
+
+    for (uint32_t i = 0; i < passes; i++) {
+        motor_pwm_step(MOTOR_L1, MOTOR_L0, dir_l, speed_percent);
+        motor_pwm_step(MOTOR_R1, MOTOR_R0, dir_r, speed_percent);
+    }
+}
+
+// How much duty cycle (%) to shave off per deceleration step, and how
+// long to hold each step, while curving to a stop.
+#define CURVE_STOP_STEP_PERCENT   5
+#define CURVE_STOP_STEP_MS        40
+
+/**
+ * =====================================================================
+ *  SECTION 2: MOVEMENT FEATURES
+ * =====================================================================
+ * @brief FEATURE: Curve to a Stop.
+ * Instead of cutting the motors dead (which jolts the chassis and can
+ * skid the wheels), this ramps the duty cycle down in small steps while
+ * still driving in the same direction, so the robot glides to a smooth
+ * halt instead of a sudden one.
+ *
+ * @param dir_l          direction the left wheel was moving (-1, 0, 1)
+ * @param dir_r          direction the right wheel was moving (-1, 0, 1)
+ * @param start_speed    duty cycle (0-100) the car was cruising at
+ **/
+void curve_to_stop(int8_t dir_l, int8_t dir_r, uint8_t start_speed) {
+    uint8_t speed = start_speed;
+    while (speed > 0) {
+        run_timed_move(dir_l, dir_r, speed, CURVE_STOP_STEP_MS);
+        speed = (speed > CURVE_STOP_STEP_PERCENT) ? speed - CURVE_STOP_STEP_PERCENT : 0;
+    }
+    // Final hard stop, both pins of both motors low.
+    GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1);
+    GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1);
+}
+
+/**
+ * @brief FEATURE: Point Turn - Spin Clockwise.
+ * Left wheel drives forward, right wheel drives backward at the same
+ * speed, so the car rotates in place around its own center (zero net
+ * forward travel), spinning clockwise.
+ **/
+void point_turn_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
+    run_timed_move(1, -1, speed_percent, duration_ms);
+    curve_to_stop(1, -1, speed_percent);
+}
+
+/**
+ * @brief FEATURE: Point Turn - Spin Counter-Clockwise.
+ * Left wheel drives backward, right wheel drives forward at the same
+ * speed — the mirror image of point_turn_clockwise().
+ **/
+void point_turn_counter_clockwise(uint8_t speed_percent, uint16_t duration_ms) {
+    run_timed_move(-1, 1, speed_percent, duration_ms);
+    curve_to_stop(-1, 1, speed_percent);
+}
+
+/**
+ * @brief FEATURE: Zero-Turn Arc — pivot to the RIGHT.
+ * The right wheel is held completely stopped (dir = 0) while the left
+ * wheel drives forward, so the car pivots around the stationary right
+ * wheel instead of spinning around its own center.
+ **/
+void zero_turn_arc_right(uint8_t speed_percent, uint16_t duration_ms) {
+    run_timed_move(1, 0, speed_percent, duration_ms);
+    curve_to_stop(1, 0, speed_percent);
+}
+
+/**
+ * @brief FEATURE: Zero-Turn Arc — pivot to the LEFT.
+ * The left wheel is held completely stopped while the right wheel
+ * drives forward, pivoting the car around the stationary left wheel.
+ **/
+void zero_turn_arc_left(uint8_t speed_percent, uint16_t duration_ms) {
+    run_timed_move(0, 1, speed_percent, duration_ms);
+    curve_to_stop(0, 1, speed_percent);
+}
+
+/**
+ * =====================================================================
+ *  SECTION 3: TAP-COUNT BASED FORWARD / BACK / LEFT / RIGHT
+ * =====================================================================
+ * "Press the button once -> move for a short time and stop.
+ *  Press the button twice in a row -> move for a longer time and stop."
+ * This block gives every direction that same behavior.
+ **/
+#define DOUBLE_TAP_WINDOW_MS   400   // max gap between taps to still count as "double"
+#define RELEASE_DEBOUNCE_MS    50    // settle time after a button is released
+
+typedef enum {
+    TAP_NONE = 0,
+    TAP_SINGLE,
+    TAP_DOUBLE
+} tap_result_t;
+
+/**
+ * @brief Call this exactly when is_pressed() has just been seen true.
+ * It waits for that first press to release, then watches for a short
+ * window to see whether a SECOND press follows right away.
+ *
+ * @param is_pressed function pointer to one of the JOY_x_pressed() wrappers below
+ * @return TAP_SINGLE if only one press happened, TAP_DOUBLE if a second
+ *         press arrived within DOUBLE_TAP_WINDOW_MS
+ **/
+static tap_result_t detect_tap_pattern(uint8_t (*is_pressed)(void)) {
+    // Wait for the (already-detected) first press to be released.
+    while (is_pressed()) {
+        Delay_Ms(10);
+    }
+    Delay_Ms(RELEASE_DEBOUNCE_MS);
+
+    uint16_t waited_ms = 0;
+    while (waited_ms < DOUBLE_TAP_WINDOW_MS) {
+        if (is_pressed()) {
+            // Second press arrived in time -> it's a double tap.
+            while (is_pressed()) {
+                Delay_Ms(10);
+            }
+            return TAP_DOUBLE;
+        }
+        Delay_Ms(10);
+        waited_ms += 10;
+    }
+    return TAP_SINGLE;
+}
+
+// Tiny wrappers so the macros above can be passed around as function
+// pointers (JOY_x_pressed() is a macro, not a real function, so it
+// can't be taken by address on its own).
+static uint8_t joy2_pressed_fn(void) { return JOY_2_pressed(); }
+static uint8_t joy8_pressed_fn(void) { return JOY_8_pressed(); }
+static uint8_t joy4_pressed_fn(void) { return JOY_4_pressed(); }
+static uint8_t joy6_pressed_fn(void) { return JOY_6_pressed(); }
+
+// How long each kind of move runs for, in milliseconds. Tune these to
+// taste — bigger numbers = the car travels further per tap.
+#define TAP_MOVE_DURATION_MS    600    // single press -> short nudge
+#define HOLD_MOVE_DURATION_MS   2200   // double press ("press twice in a row") -> longer run
+
+/**
+ * @brief Shared "press once = short move, press twice in a row = long
+ * move" handler. Forward/back/left/right all call this with their own
+ * wheel directions and their own button, so the timing logic lives in
+ * exactly one place.
+ *
+ * @param dir_l, dir_r   wheel directions for this move (see run_timed_move)
+ * @param is_pressed     function pointer used to detect the double tap
+ **/
+static void handle_directional_tap(int8_t dir_l, int8_t dir_r, uint8_t (*is_pressed)(void)) {
+    tap_result_t tap = detect_tap_pattern(is_pressed);
+    uint16_t duration_ms = (tap == TAP_DOUBLE) ? HOLD_MOVE_DURATION_MS : TAP_MOVE_DURATION_MS;
+
+    run_timed_move(dir_l, dir_r, motor_speed_percent, duration_ms);
+    // Curve to a stop instead of an abrupt cutoff at the end of every move.
+    curve_to_stop(dir_l, dir_r, motor_speed_percent);
+}
+
+/**
+ * =====================================================================
+ *  SECTION 4: MAIN ROBOT CAR LOOP — wires all the features above to buttons
+ * =====================================================================
+ * Button map used inside this routine:
+ *   JOY_2 (up)    -> Forward   : tap = short move, double-tap = long move
+ *   JOY_8 (down)  -> Backward  : tap = short move, double-tap = long move
+ *   JOY_4 (left)  -> Point Turn Counter-Clockwise (tap/double-tap timed)
+ *   JOY_6 (right) -> Point Turn Clockwise (tap/double-tap timed)
+ *   JOY_1         -> Zero-Turn Arc, pivot LEFT  (right wheel stopped)
+ *   JOY_7         -> Zero-Turn Arc, pivot RIGHT (left wheel stopped)
+ *   JOY_5 (middle)-> Speed Control: cycles LOW -> MEDIUM -> HIGH -> LOW ...
+ *   JOY_9         -> Exit robot car mode, back to paint app
+ * Every move ends with curve_to_stop() so the car always glides to a
+ * halt rather than slamming to a stop.
+ **/
+void robot_car_routine(void) {
+    robot_init();
+
+    // Delete the InspireRV logo in the beginning
+    for (int i = 0; i < NUM_LEDS; i++) {
+        canvas[i].layer = CLEARROUND_LAYER;
+        canvas[i].color = clearground;
+    }
+
+    while (1) {
+        if (JOY_2_pressed()) {
+            // FORWARD
+            handle_directional_tap(1, 1, joy2_pressed_fn);
+        }
+        else if (JOY_8_pressed()) {
+            // BACKWARD
+            handle_directional_tap(-1, -1, joy8_pressed_fn);
+        }
+        else if (JOY_4_pressed()) {
+            // LEFT = Point Turn Counter-Clockwise
+            handle_directional_tap(-1, 1, joy4_pressed_fn);
+        }
+        else if (JOY_6_pressed()) {
+            // RIGHT = Point Turn Clockwise
+            handle_directional_tap(1, -1, joy6_pressed_fn);
+        }
+        else if (JOY_1_pressed()) {
+            // Zero-Turn Arc pivoting left (right wheel drives, left stopped)
+            zero_turn_arc_left(motor_speed_percent, TAP_MOVE_DURATION_MS);
+        }
+        else if (JOY_7_pressed()) {
+            // Zero-Turn Arc pivoting right (left wheel drives, right stopped)
+            zero_turn_arc_right(motor_speed_percent, TAP_MOVE_DURATION_MS);
+        }
+        else if (JOY_5_pressed()) {
+            // SPEED CONTROL: one press = step to the next speed level.
+            robot_cycle_speed();
+            // Wait for release so a single press doesn't cycle repeatedly.
+            while (JOY_5_pressed()) {
+                Delay_Ms(10);
+            }
+        }
+        else if (JOY_9_pressed()) {
+            appChosen = rv_paint;
+            break;
+        }
+
+        Delay_Ms(20);
+    }
+
+    // Motors off on exit.
+    GPIO_digitalWrite_lo(MOTOR_L0); GPIO_digitalWrite_lo(MOTOR_L1);
+    GPIO_digitalWrite_lo(MOTOR_R0); GPIO_digitalWrite_lo(MOTOR_R1);
+
+    Delay_Us(200);
+}
+
+// Checks how long button 9 is held.
+// Returns: 0 = not pressed, 1 = short tap, 2 = long hold (1.5+ sec)
+uint8_t check_JOY9_hold(void) {
+    if (!JOY_9_pressed()) return 0;
+    uint16_t held_ms = 0;
+    while (JOY_9_pressed() && held_ms < 1500) {
+        Delay_Ms(50);
+        held_ms += 100;
+    }
+    return (held_ms >= 1500) ? 2 : 1;
+}
+
+// ============================================================
+// >>> ADDED FOR ROBOT CAR MODE - END <<<
+// ============================================================
+
+int main(void) {
+    SystemInit();
+    ADC_init();
+    clear();
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+    Delay_Ms(delay);
+    i2c_init();
+    //printf("I2C Initialized\n");
+    init_storage();
+    // Hold button Y at startup to reset all paints
+    JOY_sound(1000, 100);
+    uint16_t delay_countdown = 50;
+    while (delay_countdown-- > 0) {
+        if (JOY_Y_pressed()) {
+            erase_all_paint_saves();
+            // Visual indication of paint save reset
+            red_screen();
+            #ifdef DEBUG_VERBOSE
+            printf("Paint reset\n");
+            printf("DEBUG: %d\n", __LINE__);
+            #endif
+            Delay_Ms(1000);
+        }
+        Delay_Ms(1);
+    }
+
+    // >>> ADDED FOR ROBOT CAR MODE - START <<<
+    // Hold button 1 during startup to enter Robot Car mode
+    if (JOY_1_pressed()) {
+        appChosen = robot_car;
+        printf("Entering Robot Car mode\n");
+    }
+    // >>> ADDED FOR ROBOT CAR MODE - END <<<
+
+    print_status_storage();
+
+    //app_selected app = rv_paint;
+
+    //display_stored_paints();
+    iconShow();
+
+    Delay_Ms(delay*3);
+
+    printf("Select App: %d\n",appChosen);
+    appRunningRoutine();
+    Delay_Ms(delay);
+    while (1) {
+        if (JOY_Y_pressed()) {
+            NVIC_SystemReset();
+        }
+        Delay_Ms(200);
+    }
+}
+
+
+//////////////////////////////////////////////////
+//**********************************************//
+//*************   App Selection   **************//
+//**********************************************//
+//////////////////////////////////////////////////
+void appRunningRoutine(void){
+    // TO BE DELETED: Test out robot code
+    appChosen = robot_car;// delete this later
+
+    while (1) {
+        switch (appChosen) {
+            printf("appChosen now is %d \n", appChosen);
+            case rv_paint:
+                // TO BE UNCOMMENT: DON'T USE FOR NOW
+                painting_routine();
+                break;
+            case rv_code:
+                // rv_code_routine();
+                break;
+            // >>> ADDED FOR ROBOT CAR MODE <<<
+            case robot_car:
+                robot_car_routine();
+                break;
+            default:
+                red_screen();
+                Delay_Ms(1000);
+                break;
+        }
+    }
+    printf("App Exited\n");
+}
+ 
+
+
+//////////////////////////////////////////////////
+//**********************************************//
+//****************  RV Code    ****************//
+//**********************************************//
+//////////////////////////////////////////////////
+
+void rv_code_routine(void) {
+    printf("Game Start\n");
+    for (int i = 0; i < NUM_LEDS; i++) {
+        if(i <= 7 && i >=4){
+            if((8-i) == currentPage){
+                canvas[i].layer = PAGEGROUND_LAYER;
+                canvas[i].color.r=200;
+            }
+            else{
+                canvas[i].layer = PAGEGROUND_LAYER;
+                canvas[i].color = pageground;
+            }
+
+        }
+        else{
+            canvas[i].layer = CLEARROUND_LAYER;
+            canvas[i].color = clearground;
+        }
+    }
+    currentPage = 1;
+    //toCodingSpace(currentPage);
+    flushCanvas();
+    while (1) {
+        Delay_Ms(200);
+        int8_t user_input = matrix_pressed_two();
+        if (user_input == no_button_pressed) {
+            if (JOY_1_pressed()) {
+                printf("Enter Code loading screen!\n");
+                choose_load_page(rv_code);
+                Delay_Ms(500);
+                printf("Exit Code loading screen!\n");
+                //flushCanvas();
+
+            } else if (JOY_2_pressed()){
+                choose_led_brightness();
+                Delay_Ms(1000);
+
+            } else if (JOY_3_pressed()){
+                // save paint
+                for (int _code_line = 0; _code_line <_TOTAL_CODE_LINE; _code_line++) {
+                   uint8_t _temp_page = _code_line/7;
+                   uint8_t _temp_line = _code_line%7;
+                   opCodeToStored[_code_line] = 0;
+                   for (int i = 7; i >= 0; i--) {
+                       if(opCodeStorage[_temp_page][_temp_line][i]>0)
+                            if(i == 7)
+                               opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x80;
+                            else if(i == 6)
+                               opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x40;
+                            else if(i == 5)
+                               opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x20;
+                            else if(i == 4)
+                               opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x10;
+                            else if(i == 3)
+                               opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x08;
+                            else if(i == 2)
+                              opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x04;
+                            else if(i == 1)
+                              opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x02;
+                            else if(i == 0)
+                              opCodeToStored[_code_line] = opCodeToStored[_code_line]|0x01;
+                   }
+                }
+                printf("Exit Coding mode, entering save\n");
+                choose_save_page(rv_code);
+                printf("Exit Code saving screen!\n");
+                //flushCanvas();
+                //break;
+            } else if (JOY_4_pressed()){
+                printf("Coding workspace\n");
+                /*for (int _code_line = 0; _code_line <_TOTAL_CODE_LINE; _code_line++) {
+                   uint8_t _temp_page = _code_line/7;
+                   uint8_t _temp_line = _code_line%7;
+                   for(int i = 7; i >= 0; i--){
+                       printf("%d, ",opCodeStorage[_temp_page][_temp_line][i]);
+                   }
+                   printf("\n");
+                }*/
+
+                toCodingSpace(currentPage);
+
+                //flushCanvas();
+            } else if (JOY_5_pressed()){
+                printf("Run Result\n");
+                rvCodeRun(1);
+                toCodingSpace(currentPage);
+            } else if (JOY_6_pressed()){
+                printf("Simulation workspace\n");
+                printf("Run Program\n");
+                rvCodeRun(0);
+                toCodingSpace(currentPage);
+            } else if (JOY_7_pressed()) {
+                // save paint
+                appChosen = rv_code;
+                printf("Clear\n");
+                Delay_Ms(500);
+                break;
+            } else if (JOY_8_pressed()){
+                for (int _code_line = 0; _code_line <7; _code_line++) {
+                   for(int i = 7; i >= 0; i--){
+                       opCodeStorage[currentPage-1][_code_line][i]=0;
+                   }
+                }
+                for (int i = 8; i < NUM_LEDS; i++) {
+                   canvas[i].layer = CLEARROUND_LAYER;
+                   canvas[i].color = clearground;
+                }
+                flushCanvas();
+            } else if (JOY_9_pressed()){
+                uint8_t hold_result = check_JOY9_hold();
+                if (hold_result == 2) {
+                    appChosen = robot_car;
+                    printf("Entering Robot Car mode (long press)\n");
+                } else {
+                    appChosen = rv_paint;
+                    printf("Exit paint mode, entering coding\n");
+                }
+                Delay_Ms(500);
+                break;
+            }
+            continue;
+        }
+        printf("User input: %d\n",user_input);
+
+        // user sets canvas color
+        if(user_input > 7){
+            if(canvas[user_input].layer == CLEARROUND_LAYER){
+                uint8_t code_line = (7-user_input/8);
+                uint8_t code_bit = (user_input%8);
+                canvas[user_input].layer = FOREGROUND_LAYER;
+
+                if(code_bit < 3){
+                    canvas[user_input].color = valueColor;
+                } else{
+                    canvas[user_input].color = opcodeColor;
+                }
+                //programStored[user_input] = 1;
+                opCodeStorage[currentPage-1][code_line][code_bit] = 1;
+            }
+            else {
+                canvas[user_input].layer = CLEARROUND_LAYER;
+                canvas[user_input].color = clearground;
+                //programStored[user_input] = 0;
+                uint8_t code_line = (7-user_input/8);
+                uint8_t code_bit = (user_input%8);
+                opCodeStorage[currentPage-1][code_line][code_bit] = 0;
+            }
+            printf("Canvas[%d] set to R:%d G:%d B:%d\n", user_input, canvas[user_input].color.r, canvas[user_input].color.g, canvas[user_input].color.b);
+            flushCanvas();
+        }
+        else if(user_input<8 && user_input>3){
+            currentPage = (8-user_input);
+            printf("Show Page %d | ", currentPage);
+            toCodingSpace(currentPage);
+            flushCanvas();
+        }
+    }
+}
+
+
+void rvCodeRun(uint8_t direct_result){
+    //line one
+    if(direct_result){
+        timeout_var_code =1;
+        timeout_line_code =1;
+    }
+    uint8_t opCode_line_storage[_TOTAL_CODE_LINE] = {0};
+    uint8_t var_line_storage[_TOTAL_CODE_LINE] = {0};
+    uint8_t opGrp_line_storage[_TOTAL_CODE_LINE] = {0};
+    int8_t currentDirection = 8;
+    pointerLocation = 36;
+    //turtleBody = 28;
+    int8_t rVariable = 7,gVariable=7,bVariable=7,xVariable=4,yVariable=4,loopVariable=0;
+    uint8_t turtStatus = 1;
+    uint8_t penStatus = 0;
+    uint8_t line_run = 0;
+    uint8_t var_run = 0;
+    uint8_t jump_variable = 0;
+    //uint8_t jump_var_flag = 0;
+    uint16_t sound_freq = 1000;
+    uint16_t sound_dur = 100;
+    uint32_t timeout_f = timeout_flash;
+    uint32_t timeout_lc = timeout_line_code;
+    uint32_t timeout_varc = timeout_var_code;
+    //uint8_t y_pos = 0;
+    //uint8_t x_pos =0;
+    char * ptr;
+    for (ptr = (char *)rv_coding_board; ptr < (char *)(rv_coding_board + 64);
+         ptr += sizeof(rvCodeParts)) {
+        *(rvCodeParts *)ptr = (rvCodeParts){'0', rvClearColor};
+    }
+    printf("run here\n");
+    for (int _code_line = 0; _code_line <_TOTAL_CODE_LINE; _code_line++) {
+        uint8_t _temp_page = _code_line/7;
+        uint8_t _temp_line = _code_line%7;
+        opCode_line_storage[_code_line] = opCodeExtraction(opCodeStorage[_temp_page][_temp_line]);
+        opGrp_line_storage[_code_line] = opGroupExtraction(opCodeStorage[_temp_page][_temp_line]);
+        var_line_storage[_code_line] = varExtraction(opCodeStorage[_temp_page][_temp_line]);
+        //if(opCode_line_storage[_code_line] > 0)
+        printf("OP: %d | Line: %d, code: %d, var: %d\n",opGrp_line_storage[_code_line], _code_line,opCode_line_storage[_code_line], var_line_storage[_code_line]);
+    }
+    printf("enter loop\n");
+
+    while (1){
+        --timeout_f;
+        --timeout_lc;
+        /* 63 62 61 60 59 58 57 56
+         * 55 54 53 52 51 50 49 48
+         * 47 46 45 44 43 42 41 40
+         * 39 38 37 36 35 34 33 32
+         * 31 30 29 28 27 26 25 24
+         * 23 22 21 20 19 18 17 16
+         * 15 14 13 12 11 10 09 08
+         * 07 06 05 04 03 02 01 00
+         */
+        if(timeout_lc == 0 && line_run <_TOTAL_CODE_LINE){
+            //printf("Check lines %d of opgrp: %d | opcode: %d | value: %d\n", line_run,opGrp_line_storage[line_run],opCode_line_storage[line_run],var_line_storage[line_run]);
+            //check opcode group
+            if(opGrp_line_storage[line_run] == _OPCODE_MOVE){
+                switch(opCode_line_storage[line_run]){
+                    case _RVCODE_OPCODE_FD0:
+                        currentDirection = _DIR_FD0;
+                        break;
+                    case _RVCODE_OPCODE_FD45:
+                        currentDirection = _DIR_FD45;
+                        break;
+                    case _RVCODE_OPCODE_FD90:
+                        currentDirection = _DIR_FD90;
+                        break;
+                    case _RVCODE_OPCODE_FD135:
+                        currentDirection = _DIR_FD135;
+                        break;
+                    case _RVCODE_OPCODE_FD180:
+                        currentDirection = _DIR_FD180;
+                        break;
+                    case _RVCODE_OPCODE_FD225:
+                        currentDirection = _DIR_FD225;
+                        break;
+                    case _RVCODE_OPCODE_FD270:
+                        currentDirection = _DIR_FD270;
+                        break;
+                    case _RVCODE_OPCODE_FD315:
+                        currentDirection = _DIR_FD315;
+                        break;
+                    default:
+                        currentDirection = _DIR_STOP;
+                        break;
+                }
+                if(var_run == 0){
+                    var_run = var_line_storage[line_run];
+                    if(var_line_storage[line_run] == 0){
+                        //printf("Line %d Code Done, Next Line | Head code %d\n", line_run, pointerLocation);
+                        line_run++;
+                        timeout_lc = timeout_line_code;
+                     }
+                }
+            }
+            else if(opGrp_line_storage[line_run] == _OPCODE_PEN){
+                //printf("entered Pen Stage 1\n");
+                switch(opCode_line_storage[line_run]){
+                    case _RVCODE_OPCODE_TURT:
+                        if(var_line_storage[line_run] == 1){
+                            turtStatus = 1;
+                        }
+                        else{
+                            turtStatus = 0;
+                        }
+                        break;
+                    case _RVCODE_OPCODE_PROSPEED:
+                        if(!direct_result){
+                            timeout_var_code = 150 - ((int8_t)var_line_storage[line_run]-4)*40;
+                            timeout_line_code = 300 - ((int8_t)var_line_storage[line_run]-4)*40;
+                        }
+
+                        break;
+                    case _RVCODE_OPCODE_SOUNDDUR:
+                        sound_dur = 50+var_line_storage[line_run]*100;
+                        break;
+                    case _RVCODE_OPCODE_SOUNDFREQ:
+                        switch(var_line_storage[line_run]){
+                            case 0:
+                                sound_freq = NOTE_C4;
+                                break;
+                            case 1:
+                                sound_freq = NOTE_D4;
+                                break;
+                            case 2:
+                                sound_freq = NOTE_E4;
+                                break;
+                            case 3:
+                                sound_freq = NOTE_F4;
+                                break;
+                            case 4:
+                                sound_freq = NOTE_G4;
+                                break;
+                            case 5:
+                                sound_freq = NOTE_A4;
+                                break;
+                            case 6:
+                                sound_freq = NOTE_B4;
+                                break;
+                            case 7:
+                                sound_freq = NOTE_C5;
+                                break;
+                            default:
+                                sound_freq = NOTE_C4;
+                                break;
+                        }
+                        JOY_sound(sound_freq,sound_dur);
+                        break;
+                    case _RVCODE_OPCODE_PENRGB:
+                        if(var_line_storage[line_run]== 0){
+                            penStatus = 0;
+                        }
+                        else{
+                            penStatus = 1; 
+                            updatePendownColorFromBits(var_line_storage[line_run], rVariable, gVariable, bVariable);
+                            
+                            /* SAME AS BELOW HERE:
+                            if((var_line_storage[line_run]&0x04)==0x04)
+                                rvPendownColor.r = 36*rVariable;
+                            else
+                                rvPendownColor.r = 0;
+                            if((var_line_storage[line_run]&0x02)==0x02)
+                                rvPendownColor.g = 36*gVariable;
+                            else
+                                rvPendownColor.g = 0;
+                            if((var_line_storage[line_run]&0x01)==0x01)
+                                rvPendownColor.b = 36*bVariable;
+                            else
+                                rvPendownColor.b = 0; 
+                            */
+
+                            #ifdef DEBUG_VERBOSE
+                            printf("Leave Color R: %d, G: %d, B:%d\n",rvPendownColor.r, rvPendownColor.g, rvPendownColor.b);
+                            #endif
+                        }
+                        break;
+                    case _RVCODE_OPCODE_TURT_POS:
+                        if(turtStatus == 1){
+                            if(penStatus == 1){
+                                rv_coding_board[pointerLocation] = (rvCodeParts){'0', rvPendownColor};
+                            }
+                            else{
+                                rv_coding_board[pointerLocation] = (rvCodeParts){'0', rvClearColor};
+                            }
+
+
+                        }
+                        switch(var_line_storage[line_run]){
+                            case 0:
+                                pointerLocation = 36;
+                                break;
+                            case 1:
+                                pointerLocation = 56;
+                                break;
+                            case 2:
+                                pointerLocation = 0;
+                                break;
+                            case 3:
+                                pointerLocation = 7;
+                                break;
+                            case 4:
+                                pointerLocation = 63;
+                                break;
+                            case 7:
+                                pointerLocation = (yVariable * 8 + (7-xVariable));
+                                break;
+                            default:
+                                //pointerLocation = pointerLocation;
+                                break;
+                        }
+                        if(turtStatus == 1){
+                            rv_coding_board[pointerLocation] = (rvCodeParts){'P', rvPointerColor};
+                            logoDisplay();
+                        }
+
+                        break;
+                    case _RVCODE_OPCODE_CLRSCREEN:
+                        if((var_line_storage[line_run]&0x04)==0x04)
+                            rvPendownColor.r = 36*rVariable;
+                        else
+                            rvPendownColor.r = 0;
+                        if((var_line_storage[line_run]&0x02)==0x02)
+                            rvPendownColor.g = 36*gVariable;
+                        else
+                            rvPendownColor.g = 0;
+                        if((var_line_storage[line_run]&0x01)==0x01)
+                            rvPendownColor.b = 36*bVariable;
+                        else
+                            rvPendownColor.b = 0;
+                        for (ptr = (char *)rv_coding_board; ptr < (char *)(rv_coding_board + 64);
+                             ptr += sizeof(rvCodeParts)) {
+                            *(rvCodeParts *)ptr = (rvCodeParts){'0', rvPendownColor};
+                        }
+                        break;
+                    default:
+                        //currentDirection = _DIR_STOP;
+                        break;
+                }
+                //printf("Pen Line %d Code Done, Next Line | Head code %d\n", line_run, pointerLocation);
+                line_run++;
+                timeout_lc = timeout_line_code;
+            }
+            else if(opGrp_line_storage[line_run] == _OPCODE_OPTION){
+                switch(opCode_line_storage[line_run]){
+                    case _RVCODE_OPCODE_LOADCODE:
+                        break;
+                    case _RVCODE_OPCODE_LOADMUSIC:
+                        break;
+                    case _RVCODE_OPCODE_LOADPAINT:
+                        printf("Load Paint %d\n", var_line_storage[line_run]);
+                        load_paint(var_line_storage[line_run], led_array, 1);
+
+                        for (int i = 0; i < NUM_LEDS; i++) {
+                            rv_coding_board[i] = (rvCodeParts){'x', led_array[i]};
+                            //canvas[i].color = led_array[i];
+                        }
+                        //flushCanvas();
+                        break;
+                    case _RVCODE_OPCODE_JUMPP1:
+                        line_run = (var_line_storage[line_run]-1);
+                        printf("-----Jump1 to line %d\n", line_run);
+                        break;
+                    case _RVCODE_OPCODE_JUMPP2:
+                        line_run = 7+(var_line_storage[line_run]-1);
+                        printf("-----Jump2 to line %d\n", line_run);
+                        break;
+                    case _RVCODE_OPCODE_JUMPP3:
+                        line_run = 14+(var_line_storage[line_run]-1);
+                        printf("-----Jump3 to line %d\n", line_run);
+                        break;
+                    case _RVCODE_OPCODE_JUMPP4:
+                        line_run = 21+(var_line_storage[line_run]-1);
+                        printf("-----Jump4 to line %d\n", line_run);
+                        break;
+                    case _RVCODE_OPCODE_END:
+                        printf("END OpCode\n");
+                        line_run = 29;
+                        break;
+                    default:
+                        //currentDirection = _DIR_STOP;
+                        break;
+                }
+                //printf("Option Line %d Code Done, Next Line | Head code %d\n", line_run, pointerLocation);
+                line_run++;
+                timeout_lc = timeout_line_code;
+            }
+            else if(opGrp_line_storage[line_run] == _OPCODE_VARLOOP){
+                int8_t jp_temp = 0;
+                switch(opCode_line_storage[line_run]){
+                    case _RVCODE_OPCODE_RVAR:
+                        rVariable = var_line_storage[line_run];
+                        //if(jump_variable == 0)
+                            jump_variable = 1;
+                        break;
+                    case _RVCODE_OPCODE_GVAR:
+                        gVariable = var_line_storage[line_run];
+                        //if(jump_variable == 0)
+                            jump_variable = 2;
+                        break;
+                    case _RVCODE_OPCODE_BVAR:
+                        bVariable = var_line_storage[line_run];
+                        //if(jump_variable == 0)
+                            jump_variable = 3;
+                        break;
+                    case _RVCODE_OPCODE_XVAR:
+                        xVariable = var_line_storage[line_run];
+                        //if(jump_variable == 0)
+                            jump_variable = 4;
+                        break;
+                    case _RVCODE_OPCODE_YVAR:
+                        yVariable = var_line_storage[line_run];
+                        //if(jump_variable == 0)
+                            jump_variable = 5;
+                        break;
+                    case _RVCODE_OPCODE_LOOPVAR:
+                        loopVariable = var_line_storage[line_run];
+                        //if(jump_variable == 0)
+                            jump_variable = 6;
+                        break;
+                    case _RVCODE_OPCODE_MINUSSKIP:
+                        switch(jump_variable){
+                            case 1:
+                                jp_temp = rVariable;
+                                break;
+                            case 2:
+                                jp_temp = gVariable;
+                               break;
+                            case 3:
+                                jp_temp = bVariable;
+                                break;
+                            case 4:
+                                jp_temp = xVariable;
+                               break;
+                            case 5:
+                                jp_temp = yVariable;
+                               break;
+                            case 6:
+                                jp_temp = loopVariable;
+                               break;
+                            default:
+                                break;
+                        }
+                        jp_temp-=var_line_storage[line_run];
+                        //printf("LOOP minus at: %d\n",jp_temp);
+                        if(jp_temp < 0){
+                            line_run++;
+                            //jump_var_flag = 0;
+                            //printf("Skip the line %d\n",line_run);
+                        }
+                        switch(jump_variable){
+                            case 1:
+                                rVariable = jp_temp;
+                                break;
+                            case 2:
+                                gVariable = jp_temp;
+                               break;
+                            case 3:
+                                bVariable = jp_temp;
+                                break;
+                            case 4:
+                                xVariable = jp_temp;
+                               break;
+                            case 5:
+                                yVariable = jp_temp;
+                               break;
+                            case 6:
+                                loopVariable = jp_temp;
+                               break;
+                            default:
+                                break;
+                        }
+                        break;
+                    case _RVCODE_OPCODE_ADDSKIP:
+                        switch(jump_variable){
+                            case 1:
+                                jp_temp = rVariable;
+                                break;
+                            case 2:
+                                jp_temp = gVariable;
+                               break;
+                            case 3:
+                                jp_temp = bVariable;
+                                break;
+                            case 4:
+                                jp_temp = xVariable;
+                               break;
+                            case 5:
+                                jp_temp = yVariable;
+                               break;
+                            case 6:
+                                jp_temp = loopVariable;
+                               break;
+                            default:
+                                break;
+                        }
+                        jp_temp+=var_line_storage[line_run];
+                        //printf("LOOP add ast: %d\n",jp_temp);
+                        if(jp_temp>7){
+                            line_run++;
+                            //jump_var_flag = 0;
+                            //printf("Skip the line %d\n",line_run);
+                        }
+                        switch(jump_variable){
+                            case 1:
+                                rVariable = jp_temp;
+                                break;
+                            case 2:
+                                gVariable = jp_temp;
+                               break;
+                            case 3:
+                                bVariable = jp_temp;
+                                break;
+                            case 4:
+                                xVariable = jp_temp;
+                               break;
+                            case 5:
+                                yVariable = jp_temp;
+                               break;
+                            case 6:
+                                loopVariable = jp_temp;
+                               break;
+                            default:
+                                break;
+                        }
+                        break;
+                    default:
+                        //currentDirection = _DIR_STOP;
+                        break;
+                }
+                //printf("Loop Line %d Code Done, Next Line | Head code %d\n", line_run, pointerLocation);
+                line_run++;
+                timeout_lc = timeout_line_code;
+            }
+            /*else {
+                //printf("Else Line %d Code Done, Next Line | Head code %d\n", line_run, pointerLocation);
+                line_run++;
+                timeout_lc = timeout_line_code;
+            }*/
+
+        }
+        if(opGrp_line_storage[line_run] == _OPCODE_MOVE){
+            //value round up check finished
+            if(var_run>0){
+                --timeout_varc;
+                if(timeout_varc == 0){
+                    if(penStatus == 1){
+                       rv_coding_board[pointerLocation] = (rvCodeParts){'x', rvPendownColor};
+                    }
+                    else{
+                        rv_coding_board[pointerLocation] = (rvCodeParts){'0', rvClearColor};
+                    }
+                    if((pointerLocation+currentDirection)<64 && pointerLocation+currentDirection>=0){
+                        //printf("TH+: %d | TH %d\n", (pointerLocation+currentDirection)/8, (pointerLocation)/8);
+                        if(currentDirection == _DIR_FD90 || currentDirection == _DIR_FD270){
+                            if((pointerLocation+currentDirection)/8 == (pointerLocation)/8){
+                                pointerLocation += currentDirection;
+                            }
+                        }
+                        else if(currentDirection == _DIR_FD45 || currentDirection == _DIR_FD135){
+                            if(pointerLocation%8!=0){
+                                pointerLocation += currentDirection;
+                            }
+                        }
+                        else if(currentDirection == _DIR_FD225 || currentDirection == _DIR_FD315){
+                            if(pointerLocation%8!=7){
+                                pointerLocation += currentDirection;
+                            }
+                        }
+                        else{
+                            pointerLocation += currentDirection;
+                        }
+
+                    }
+
+                    var_run--;
+                    timeout_varc = timeout_var_code;
+                    //show map
+                    /*for(int i = 63; i >0; i--){
+                        printf("%c, ",rv_coding_board[i].part);
+                        if(i%8==0){
+                            printf("\n");
+                        }
+                    }*/
+                    if(var_run == 0){
+                        printf("Moving Group - Line code ran %d | Head num: %d\n", line_run, pointerLocation);
+                        line_run++;
+                        timeout_lc = timeout_line_code;
+                    }
+                }
+            }
+        }
+        if(timeout_f == (timeout_flash/2)){
+            if(turtStatus == 1){
+                //printf("Print Pointer show\n");
+                rv_coding_board[pointerLocation] = (rvCodeParts){'P', rvPointerColor};
+
+            }
+            logoDisplay();
+        } else if(timeout_f == 0){
+           /* if(turtStatus == 1){
+                printf("Print Pointer hide\n");
+                rv_coding_board[pointerLocation] = (rvCodeParts){'0', pointer_status};
+                //logoDisplay();
+            }*/
+            if(penStatus == 1){
+              rv_coding_board[pointerLocation] = (rvCodeParts){'x', rvPendownColor};
+            }
+            else{
+              rv_coding_board[pointerLocation] = (rvCodeParts){'0', rvClearColor};
+            }
+
+
+            logoDisplay();
+            timeout_f = timeout_flash;
+        }
+
+
+        if (JOY_4_pressed()) {
+            printf("Break the loop\n");
+            break;
+        }
+
+    }
+}
+
+/// @brief Do OR operation with each case such as `0x10 | 0x01 --> 0b11`
+uint8_t opGroupExtraction(uint8_t received_message[8]){
+    return (received_message[7] ? 0x02 : 0) | (received_message[6] ? 0x01 : 0);
+    /* SAME AS BELOW: 
+    uint8_t opcodeGroup = 0;
+    for (int i = 7; i > 5; i--) {
+        if(received_message[i]>0)
+            if(i == 7){
+                opcodeGroup = opcodeGroup|0x02;
+            }
+            else if(i == 6){
+                opcodeGroup = opcodeGroup|0x01;
+            }
+    }
+    return opcodeGroup; */
+}
+
+/// @brief Do OR operation with each case that will result 5-bits value
+uint8_t opCodeExtraction(uint8_t received_message[8]){
+    uint8_t code = 0;
+    for (int i = 3; i <= 7; i++) code |= (received_message[i] ? (1 << (i - 3)) : 0);
+    return code;
+    /* SAME AS BELOW
+        uint8_t extracted_code = 0;
+        for (int i = 7; i > 2; i--) {
+            if(received_message[i]>0)
+                if(i == 7){
+                    extracted_code = extracted_code|0x10;
+                }
+                else if(i == 6){
+                    extracted_code = extracted_code|0x08;
+                }
+                else if(i == 5)
+                    extracted_code = extracted_code|0x04;
+                else if(i == 4)
+                    extracted_code = extracted_code|0x02;
+                else if(i == 3)
+                    extracted_code = extracted_code|0x01;
+        }
+        return extracted_code;
+    */
+}
+/// @brief Do OR operation with each case that will result 3-bits value
+uint8_t varExtraction(uint8_t received_message[8]){
+    uint8_t v = 0;
+    for (int i = 0; i <= 2; i++) v |= (received_message[i] ? (1 << i) : 0);
+    return v;
+    /* SAME AS BELOW HERE: 
+    uint8_t extracted_var = 0;
+    for (int i = 2; i >= 0; i--) {
+        if(received_message[i]>0)
+            if(i == 2)
+                extracted_var = extracted_var|0x04;
+            else if(i == 1)
+                extracted_var = extracted_var|0x02;
+            else if(i == 0)
+                extracted_var = extracted_var|0x01;
+    }
+    return extracted_var;
+    */
+}
+void toCodingSpace(uint8_t curr_page){
+   printf("Coding workspace Page %d\n", curr_page);
+   /*for(int i = 63; i >0; i--){
+       printf("%c, ",rv_coding_board[i].part);
+       if(i%8==0){
+           printf("\n");
+       }
+   }*/
+   clear();
+   for (int i = 0; i < 7; i++) {
+       for (int j = 7; j >= 0; j--){
+           if(opCodeStorage[curr_page-1][i][j] >0){
+               canvas[(56-i*8+j)].layer = opCodeStorage[curr_page-1][i][j];
+               if(j>2)
+                   canvas[(56-i*8+j)].color = opcodeColor;
+               else
+                   canvas[(56-i*8+j)].color = valueColor;
+           }
+           else{
+               canvas[(56-i*8+j)].layer = CLEARROUND_LAYER;
+               canvas[(56-i*8+j)].color = clearground;
+           }
+       }
+   }
+   for (int i = 4; i <= 7; i++){
+       canvas[i].layer = PAGEGROUND_LAYER;
+       canvas[i].color = pageground;
+       if((8-i)==currentPage){
+           canvas[i].color.r = 200;
+       }
+   }
+   flushCanvas();
+}
+
+/* 63 62 61 60 59 58 57 56
+ * 55 54 53 52 51 50 49 48
+ * 47 46 45 44 43 42 41 40
+ * 39 38 37 36 35 34 33 32
+ * 31 30 29 28 27 26 25 24
+ * 23 22 21 20 19 18 17 16
+ * 15 14 13 12 11 10 09 08
+ * 07 06 05 04 03 02 01 00
+ */
+
+void logoDisplay(void){
+    clear();
+    for (int i = 0; i < 64; i++) {
+        set_color(i, rv_coding_board[i].current_color, brightness_divisor);
+    }
+    /*for(int i = 63; i >0; i--){
+        printf("%c, ",rv_coding_board[i].part);
+        if(i%8==0){
+            printf("\n");
+        }
+    }*/
+    //printf("\n");
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
+
+//////////////////////////////////////////////////
+//**********************************************//
+//****************  RV Paint    ****************//
+//**********************************************//
+//////////////////////////////////////////////////
+
+void painting_routine(void) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+        canvas[i].layer = CLEARROUND_LAYER;
+        canvas[i].color = clearground;
+    }
+    flushCanvas();
+    while (1) {
+        Delay_Ms(200);
+        int8_t user_input = matrix_pressed_two();
+        if (user_input == no_button_pressed) {
+
+            if (JOY_1_pressed()) {
+                #ifdef DEBUG_VERBOSE
+                printf("Enter paint loading screen!\n");
+                #endif
+
+                choose_load_page(rv_paint);
+                Delay_Ms(1000);
+
+                #ifdef DEBUG_VERBOSE
+                printf("Exit paint loading screen!\n");
+                #endif
+            }
+            else if (JOY_2_pressed()) {
+                // save paint
+                //printf("Enter Brightness mode\n");
+                choose_led_brightness();
+                 Delay_Ms(1000);
+                // printf("Exit Brightness mode\n");
+                //break;
+            }
+            else if (JOY_3_pressed()) {
+                // save paint
+                printf("Exit paint mode, entering save\n");
+                choose_save_page(rv_paint);
+                 Delay_Ms(1000);
+                 printf("Exit paint Saving screen!\n");
+                //break;
+            }
+            else if (JOY_4_pressed()) {
+                colorPaletteSelection(&foreground);
+            }
+            else if (JOY_5_pressed()) {
+                renderBinaryGameHW(brightness_divisor);
+            }
+            else if (JOY_6_pressed()) {
+                colorPaletteSelection(&background);
+            }
+
+            else if (JOY_7_pressed()) {
+                // save paint
+                appChosen = rv_code;
+                printf("Exit paint mode, entering coding\n");
+                Delay_Ms(500);
+                break;
+            }
+            else if (JOY_8_pressed()) {
+                bucketFill();
+                /*for (int i = 0; i < NUM_LEDS; i++) {
+                   canvas[i].layer = CLEARROUND_LAYER;
+                   canvas[i].color = clearground;
+                }
+                flushCanvas();*/
+            }
+            else if (JOY_9_pressed()) {
+                uint8_t hold_result = check_JOY9_hold();
+                if (hold_result == 2) {
+                    appChosen = robot_car;
+                    printf("Entering Robot Car mode (long press)\n");
+                } else {
+                    // save paint
+                    appChosen = rv_paint;
+                    printf("Clear\n");
+                }
+                Delay_Ms(500);
+                break;
+            }
+
+            continue;
+        }
+        printf("User input: %d\n",user_input);
+        // user sets canvas color
+        if(canvas[user_input].layer == CLEARROUND_LAYER){
+            canvas[user_input].layer = FOREGROUND_LAYER;
+            canvas[user_input].color = foreground;
+        }
+        else if (canvas[user_input].layer == FOREGROUND_LAYER) {
+            canvas[user_input].layer = BACKGROUND_LAYER;
+            canvas[user_input].color = background;
+        }
+        else {
+            canvas[user_input].layer = CLEARROUND_LAYER;
+            canvas[user_input].color = clearground;
+        }
+        printf("Canvas[%d] set to %s layer\n", user_input,
+            canvas[user_input].layer == FOREGROUND_LAYER ? "FOREGROUND" : canvas[user_input].layer == BACKGROUND_LAYER ? "BACKGROUND":"CLEARGROUND");
+        printf("Canvas color set to R:%d G:%d B:%d\n", canvas[user_input].color.r,
+            canvas[user_input].color.g, canvas[user_input].color.b);
+        /*for (int i = 0; i < NUM_LEDS; i++) {
+            printf("Canva: %d\n",canvas[i].color);
+        }*/
+        flushCanvas();
+    }
+}
+
+void iconShow(void){
+    clear();
+    int8_t current_display_icon = 0;
+    uint16_t _icon_page_no = current_display_icon * sizeof_paint_data_aspage + app_icon_page_no;
+
+    if (!is_page_used(_icon_page_no + page_status_addr_begin) || !is_page_used(_icon_page_no + page_status_addr_begin + 1) || !is_page_used(_icon_page_no + page_status_addr_begin + 2)) {
+        printf("Icon %d not found\n", _icon_page_no / 3);
+        fill_logo();
+    }
+    else {
+        printf("Displaying icon %d\n", _icon_page_no);
+        load_paint(_icon_page_no / sizeof_paint_data_aspage, led_array, 1);
+        for (int i = 0; i < NUM_LEDS; i++){
+            led_array[i].r = led_array[i].r / 10;
+            led_array[i].g = led_array[i].g / 10;
+            led_array[i].b = led_array[i].b / 10;
+        }
+    }
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
+
+
+//////////////////////////////////////////////////
+//**********************************************//
+//*****************  Storage   *****************//
+//**********************************************//
+//////////////////////////////////////////////////
+
+void init_storage(void) {
+    if (!is_storage_initialized()) {
+        reset_storage();
+        printf("Storage initialized\n");
+    }
+    else {
+        printf("Storage already initialized\n");
+    }
+}
+
+uint8_t is_storage_initialized(void) {
+    // Creates a temporary buffer to hold bytes read from EEPROM
+    uint8_t data[init_status_reg_size];
+    // Reads (retrieve information) init_status_reg_size bytes starting at init_status_addr_begin from the EEPROM into data
+    i2c_read(EEPROM_ADDR, init_status_addr_begin, I2C_REGADDR_2B, data, init_status_reg_size);
+    // Check if this EEPROM block has already been initialized
+    for (uint8_t i = 0; i < init_status_reg_size; i++) {
+        if (data[i] != *(init_status_data + i)) {
+            return 0;
+        }
+    }
+    // If success, this means EEPROM contents look valid and already initialized
+    return 1;
+}
+
+void reset_storage(void) {
+    // Writes init_status_data into the initialization-signature area, which marks the storage as “initialized.”
+    i2c_write(EEPROM_ADDR, init_status_addr_begin, I2C_REGADDR_2B, init_status_data,
+        init_status_reg_size);
+    Delay_Ms(3);
+    // Loops through every page-status byte and writes 0, make it uninitialized
+    for (uint16_t addr = page_status_addr_begin;
+         addr < page_status_addr_begin + page_status_reg_size; addr++) {
+        i2c_write(EEPROM_ADDR, addr, I2C_REGADDR_2B, (uint8_t[]){0}, sizeof(uint8_t));
+        Delay_Ms(3);
+    }
+    printf("Storage reset\n");
+}
+
+void print_status_storage(void) {
+    printf("Status storage data:\n");
+
+    for (uint16_t addr = init_status_addr_begin;
+         addr < init_status_addr_begin + init_status_reg_size; addr++) {
+        uint8_t data = 0;
+        i2c_read(EEPROM_ADDR, addr, I2C_REGADDR_2B, &data, sizeof(data));
+        // Prints the initialization status bytes, one by one
+        #ifdef DEBUG_VERBOSE
+        printf(" %d: ", addr);
+        printf(init_status_format, data);
+        #endif
+    }
+    printf("\n");
+    for (uint16_t addr = page_status_addr_begin;
+         addr < page_status_addr_begin + page_status_reg_size; addr++) {
+        uint8_t data = 0;
+        i2c_read(EEPROM_ADDR, addr, I2C_REGADDR_2B, &data, sizeof(data));
+        
+        #ifdef DEBUG_VERBOSE
+        if (data) {
+            printf("%d ", addr);
+        }
+        else {
+            printf("    ");
+        }
+        if ((addr + 1) % matrix_hori == 0) {
+            printf("\n");
+        }
+        #endif
+    }
+    printf("\n");
+}
+
+void set_page_status(uint16_t page_no, uint8_t status) {
+    if (status > 1) {
+        #ifdef DEBUG_VERBOSE
+        printf("Invalid status %d\n", status);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+
+        while (1)
+            ;
+    }
+    if (page_no < page_status_addr_begin || page_no > page_status_addr_end) {
+        #ifdef DEBUG_VERBOSE
+        printf("Invalid page number %d\n", page_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+        while (1)
+            ;
+    }
+    i2c_write(EEPROM_ADDR, page_no, I2C_REGADDR_2B, &status, sizeof(status));
+    Delay_Ms(3);
+    //printf("Page %d status set to %d\n", page_no, status);
+}
+
+uint8_t is_page_used(uint16_t page_no) {
+    if (page_no < page_status_addr_begin || page_no > page_status_addr_end) {
+        #ifdef DEBUG_VERBOSE
+        printf("Invalid page number %d\n", page_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+
+        while (1);
+    }
+    uint8_t data = 0;
+    i2c_read(EEPROM_ADDR, page_no, I2C_REGADDR_2B, &data, sizeof(data));
+    //printf("Page %d is %s\n", page_no, data ? "used" : "empty");
+    return data;
+}
+
+uint16_t calculate_page_no(uint16_t paint_no, uint8_t is_icon) {
+    if (is_icon==1) {
+        return (paint_no + app_icon_page_no) * sizeof_paint_data_aspage +
+               paint_addr_begin;
+    }
+    else {
+        return paint_no * sizeof_opcode_data_aspage +
+               opcode_addr_begin;
+    }
+}
+
+void save_paint(uint16_t paint_no, color_t * data, uint8_t is_icon) {
+    if (paint_no < 0 || paint_no > paint_addr_end) {
+        #ifdef DEBUG_VERBOSE
+        printf("Invalid paint number %d\n", paint_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+        while (1)
+            ;
+    }
+    uint16_t page_no_start = calculate_page_no(paint_no, is_icon);
+    for (uint16_t i = page_no_start; i < page_no_start + sizeof_paint_data_aspage; i++) {
+        if (is_page_used(i)) {
+            #ifdef DEBUG_VERBOSE
+            printf("Paint %d already used, overwriting\n", paint_no);
+            #endif
+            Delay_Ms(500);
+        }
+        set_page_status(i, 1);
+    }
+    i2c_result_e err = i2c_write_pages(EEPROM_ADDR, page_no_start * page_size,
+        I2C_REGADDR_2B, (uint8_t *)data, sizeof_paint_data);
+    
+    #ifdef DEBUG_VERBOSE
+    printf("Save paint result: %d\n", err);
+    #endif
+    Delay_Ms(3);
+    #ifdef DEBUG_VERBOSE
+    printf("Paint %d saved\n", paint_no);
+    #endif
+}
+
+void save_opCode(uint16_t opcode_no, uint8_t * data) {
+    if (opcode_no < 0 || opcode_no > page_status_addr_end) {
+        #ifdef DEBUG_VERBOSE
+        printf("Invalid paint number %d\n", opcode_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+        while (1);
+    }
+    uint16_t page_no_start = calculate_page_no(opcode_no, 0);
+    for (uint16_t i = page_no_start; i < page_no_start + sizeof_opcode_data_aspage; i++) {
+        if (is_page_used(i)) {
+
+            #ifdef DEBUG_VERBOSE
+            printf("Opcode %d already used, overwriting\n", opcode_no);
+            #endif
+
+            Delay_Ms(500);
+        }
+        set_page_status(i, 1);
+    }
+    i2c_result_e err = i2c_write_pages(EEPROM_ADDR, page_no_start * page_size,
+        I2C_REGADDR_2B, (uint8_t *)data, sizeof_opcode_data);
+    
+    #ifdef DEBUG_VERBOSE
+    printf("Save Opcode result: %d\n", err);
+    #endif
+    Delay_Ms(3);
+    #ifdef DEBUG_VERBOSE
+    printf("Opcode %d saved\n", opcode_no);
+    #endif
+}
+
+void load_paint(uint16_t paint_no, color_t * data, uint8_t is_icon) {
+    if (paint_no < 0 || paint_no > paint_addr_end) {
+        #ifdef DEBUG_VERBOSE
+        printf("Invalid paint number %d\n", paint_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+        while (1)
+            ;
+    }
+    uint16_t page_no_start = calculate_page_no(paint_no, is_icon);
+    #ifdef DEBUG_VERBOSE
+    printf("Loading paint_no %d from page %d, is_icon: %d\n", paint_no, page_no_start,
+        is_icon);
+    #endif
+    if (!is_page_used(page_no_start)) {
+        #ifdef DEBUG_VERBOSE
+        printf("Paint %d not found\n", paint_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+        while (1)
+            ;
+    }
+    i2c_result_e err = i2c_read_pages(EEPROM_ADDR, page_no_start * page_size,
+        I2C_REGADDR_2B, (uint8_t *)data, sizeof_paint_data);
+    
+    #ifdef DEBUG_VERBOSE
+    printf("Load paint result: %d\n", err);
+    #endif
+    Delay_Ms(3);
+    #ifdef DEBUG_VERBOSE
+    printf("Paint %d loaded\n", paint_no);
+    #endif
+}
+
+void load_opCode(uint16_t opcode_no, uint8_t * data) {
+    if (opcode_no < 0 || opcode_no > page_status_addr_end) {
+        #ifdef DEBUG_VERBOSE
+        printf("Invalid paint number %d\n", opcode_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+        while (1)
+            ;
+    }
+    uint16_t page_no_start = calculate_page_no(opcode_no, 0);
+    printf("Loading paint_no %d from page %d, is_icon: %d\n", opcode_no, page_no_start,0);
+    if (!is_page_used(page_no_start)) {
+        #ifdef DEBUG_VERBOSE
+        printf("Paint %d not found\n", opcode_no);
+        printf("DEBUG: %d\n", __LINE__);
+        #endif
+        while (1)
+            ;
+    }
+    i2c_result_e err = i2c_read_pages(EEPROM_ADDR, page_no_start * page_size,
+        I2C_REGADDR_2B, (uint8_t *)data, sizeof_opcode_data);
+    #ifdef DEBUG_VERBOSE
+    printf("Load paint result: %d\n", err);
+    #endif
+    Delay_Ms(3);
+    #ifdef DEBUG_VERBOSE
+    printf("Paint %d loaded\n", opcode_no);
+    #endif
+}
+
+void any_paint_exist(uint8_t * paint_exist) {
+    for (uint16_t _paint_page_no = paint_page_no;
+         _paint_page_no < paint_page_no_max + paint_page_no;
+         _paint_page_no += sizeof_paint_data_aspage) {
+        if (is_page_used(_paint_page_no + paint_addr_begin) &&
+            is_page_used(_paint_page_no + paint_addr_begin + 1) &&
+            is_page_used(_paint_page_no + paint_addr_begin + 2)) {
+            *paint_exist = 1;
+            return;
+        }
+    }
+    *paint_exist = 0;
+}
+
+void any_opcode_exist(uint8_t * opcode_exist) {
+    for (uint16_t _opcode_page_no = opcode_page_no;
+         _opcode_page_no < opcode_page_no_max + opcode_page_no;
+         _opcode_page_no += sizeof_paint_data_aspage) {
+        if (is_page_used(_opcode_page_no + opcode_addr_begin)) {
+            *opcode_exist = 1;
+            return;
+        }
+    }
+    *opcode_exist = 0;
+}
+
+void choose_load_page(app_selected app_current) {
+    led_display_paint_page_status(app_current);
+    int8_t button = no_button_pressed;
+	uint8_t _sizeof_data_aspage = 24, _page_no = 24, _page_addr_begin = 8;
+	if(app_current == rv_paint){
+		_sizeof_data_aspage = sizeof_paint_data_aspage;
+		_page_no = paint_page_no;
+		_page_addr_begin = paint_addr_begin;
+	} else if(app_current == rv_code){
+		_sizeof_data_aspage = sizeof_opcode_data_aspage;
+		_page_no = opcode_page_no;
+		_page_addr_begin = opcode_addr_begin;
+	}
+    while (1) {
+        button = matrix_pressed_two();
+        if (button != no_button_pressed) {
+            if (!is_page_used(button * _sizeof_data_aspage + _page_no +
+                             _page_addr_begin)) {
+                //printf("Page %d is not used\n", button);
+                // Fill the screen with red to indicate error
+                fill_color((color_t){.r = 100, .g = 0, .b = 0});
+                WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+                Delay_Ms(1000);
+                led_display_paint_page_status(app_current);
+                continue;
+            }
+
+            #ifdef DEBUG_VERBOSE
+            printf("Selected page %d\n", button);
+            #endif
+
+            /*if(appChosen == rv_paint)
+                load_paint(button, led_array, 1);
+            else if(appChosen == rv_code)
+                load_opCode(button, opCodeToStored);*/
+
+            // Put led_array to canvas
+            if(app_current == rv_paint){
+                load_paint(button, led_array, 1);
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    canvas[i].color = led_array[i];
+                }
+                //flushCanvas();
+            }
+            else if(app_current == rv_code){
+                load_opCode(button, opCodeToStored);
+                for (int i = 0; i < sizeof(opCodeToStored); i++) {
+                    opCodeStorage[i/7][i%7][0] = ((opCodeToStored[i]&0x01));
+                    opCodeStorage[i/7][i%7][1] = ((opCodeToStored[i]&0x02)>>1);
+                    opCodeStorage[i/7][i%7][2] = ((opCodeToStored[i]&0x04)>>2);
+                    opCodeStorage[i/7][i%7][3] = ((opCodeToStored[i]&0x08)>>3);
+                    opCodeStorage[i/7][i%7][4] = ((opCodeToStored[i]&0x10)>>4);
+                    opCodeStorage[i/7][i%7][5] = ((opCodeToStored[i]&0x20)>>5);
+                    opCodeStorage[i/7][i%7][6] = ((opCodeToStored[i]&0x40)>>6);
+                    opCodeStorage[i/7][i%7][7] = ((opCodeToStored[i]&0x80)>>7);
+                }
+                currentPage = 1;
+                toCodingSpace(currentPage);
+            }
+
+            #ifdef DEBUG_VERBOSE
+            printf("Paint load\n");
+            #endif
+
+            Delay_Ms(1000);
+            break;
+        }
+        else{
+            if (JOY_9_pressed()){
+                #ifdef DEBUG_VERBOSE
+                printf("Exit Loading\n");
+                #endif
+
+                break;
+            }
+        }
+        Delay_Ms(200);
+    }
+    flushCanvas();
+    //flushCanvas();
+    /*for (int i = 0; i < NUM_LEDS; i++) {
+        set_color_no_div(i, canvas[i].color);
+    }
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);*/
+}
+
+void choose_save_page(app_selected app_current) {
+    led_display_paint_page_status(app_current);
+    int8_t button = no_button_pressed;
+	uint8_t _sizeof_data_aspage = 24, _page_no = 24, _page_addr_begin = 8;
+	if(app_current == rv_paint){
+		_sizeof_data_aspage = sizeof_paint_data_aspage;
+		_page_no = paint_page_no;
+		_page_addr_begin = paint_addr_begin;
+	} else if(app_current == rv_code){
+		_sizeof_data_aspage = sizeof_opcode_data_aspage;
+		_page_no = opcode_page_no;
+		_page_addr_begin = opcode_addr_begin;
+	}
+    while (1) {
+        button = matrix_pressed_two();
+        if (button != no_button_pressed) {
+            if (is_page_used(button * _sizeof_data_aspage + _page_no +
+                             _page_addr_begin)) {
+                //printf("Page %d already used\n", button);
+                // Overwrite save
+            }
+            //printf("Selected page %d\n", button);
+            // Put canvas to led_array
+            for (int i = 0; i < NUM_LEDS; i++) {
+                set_color_no_div(i, canvas[i].color);
+            }
+
+            if(app_current == rv_paint)
+                save_paint(button, led_array, 1);
+            else if(app_current == rv_code)
+                save_opCode(button, opCodeToStored);
+
+            #ifdef DEBUG_VERBOSE
+            printf("Paint saved\n");
+            #endif
+
+            Delay_Ms(1000);
+            break;
+        }
+        else{
+            if (JOY_9_pressed()){
+                #ifdef DEBUG_VERBOSE
+                printf("Exit Saving\n");
+                #endif
+
+                break;
+            }
+        }
+        Delay_Ms(200);
+    }
+    flushCanvas();
+    //clear();
+    //WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
+
+void led_display_paint_page_status(app_selected app_current) {
+    clear();
+    if(app_current == rv_paint){
+        for (uint16_t _paint_page_no = paint_page_no;
+             _paint_page_no < paint_page_no_max + paint_page_no;
+             _paint_page_no += sizeof_paint_data_aspage) {
+            if (is_page_used(_paint_page_no + paint_addr_begin) &&
+                is_page_used(_paint_page_no + paint_addr_begin + 1) &&
+                is_page_used(_paint_page_no + paint_addr_begin + 2)) {
+                set_color((_paint_page_no - paint_page_no) / sizeof_paint_data_aspage,
+                    color_savefile_exist,normal_brightness_divisor);
+            }
+            else {
+                set_color((_paint_page_no - paint_page_no) / sizeof_paint_data_aspage,
+                    color_savefile_empty,normal_brightness_divisor);
+            }
+            //printf("Paint page number: %d\n", _paint_page_no);
+        }
+    }
+    if(app_current == rv_code){
+        for (uint16_t _opcode_page_no = opcode_page_no;
+             _opcode_page_no < opcode_page_no_max + opcode_page_no;
+             _opcode_page_no += sizeof_opcode_data_aspage) {
+            if (is_page_used(_opcode_page_no + opcode_addr_begin)) {
+                set_color((_opcode_page_no - opcode_page_no) / sizeof_opcode_data_aspage,
+                    color_savefile_exist,normal_brightness_divisor);
+            }
+            else {
+                set_color((_opcode_page_no - opcode_page_no) / sizeof_opcode_data_aspage,
+                    color_savefile_empty,normal_brightness_divisor);
+            }
+        }
+    }
+
+
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
+
+void erase_all_paint_saves(void) {
+    // Set status of paint pages to 0
+    for (uint16_t _paint_page_no = paint_page_no + page_status_addr_begin;
+         _paint_page_no < paint_page_no_max + paint_page_no; _paint_page_no++) {
+        set_page_status(_paint_page_no, 0);
+        //printf("Page is now status: %d\n", is_page_used(_paint_page_no));
+        Delay_Ms(3);
+    }
+
+    #ifdef DEBUG_VERBOSE
+    printf("All paint saves status erased\n");
+    #endif
+
+    // Erase existing data to 0
+    for (uint16_t _paint_page_no = paint_page_no + page_status_addr_begin;
+         _paint_page_no < paint_page_no_max + paint_page_no;
+         _paint_page_no += sizeof(uint8_t)) {
+        i2c_result_e err = i2c_write_pages(EEPROM_ADDR, _paint_page_no * page_size,
+            I2C_REGADDR_2B, (uint8_t[]){0}, sizeof(uint8_t));
+        
+        #ifdef DEBUG_VERBOSE
+        printf("Erase paint result: %d\n", err);
+        #endif
+
+        Delay_Ms(3);
+    }
+}
+
+//////////////////////////////////////////////////
+//**********************************************//
+//**************  LED Setting   ****************//
+//**********************************************//
+//////////////////////////////////////////////////
+
+void flushCanvas(void) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+        if(appChosen == rv_code && (i>=4 && i<8)){
+            set_color(i, canvas[i].color, normal_brightness_divisor);
+        }
+        else{
+            set_color(i, canvas[i].color, brightness_divisor);
+        }
+
+    }
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
+
+void displayColorPalette(void) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+        set_color(i, colors[i], brightness_divisor);
+    }
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+    //printf("Color palette displayed\n");
+}
+
+void bucketFill(void){
+    displayColorPalette();
+    int8_t button = no_button_pressed;
+    while (1){
+        button = matrix_pressed_two();
+        // Check if any button is pressed
+        if(button != no_button_pressed){
+            for (int i = 0; i < NUM_LEDS; i++) {
+                canvas[i].layer = PAGEGROUND_LAYER;
+                canvas[i].color = colors[button];
+                set_color(i, colors[button], brightness_divisor);
+            }
+            WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+            break;
+        }
+        else{
+            if(JOY_9_pressed()){
+                #ifdef DEBUG_VERBOSE
+                printf("Exit Saving\n");
+                #endif
+
+                break;
+            }
+        }
+        Delay_Ms(200);
+    }
+    //flushCanvas();
+}
+
+void choose_led_brightness(void){
+    led_display_brightness_status();
+    int8_t button = no_button_pressed;
+    while (1){
+        button = matrix_pressed_two();
+        if(button != no_button_pressed){
+            //printf("Selected button %d\n", button);
+            if(button<8){
+                if(button<=2){
+                    brightness_divisor = (button*button)+2;
+                }
+                else{
+                    brightness_divisor = (button*button)+1;
+                }
+                //printf("Brightness: %d\n", brightness_divisor);
+                break;
+            }
+        }
+        else{
+            if(JOY_9_pressed()){
+                #ifdef DEBUG_VERBOSE
+                printf("Exit Saving\n");
+                #endif
+                break;
+            }
+        }
+        Delay_Ms(200);
+    }
+    flushCanvas();
+
+}
+
+void led_display_brightness_status(void) {
+    clear();
+    for (int i = 0; i < 8; i++) {
+        if(i<=2){
+            set_color(i, colors[NUM_LEDS], ((i*i)+2));
+        }
+        else{
+            set_color(i, colors[NUM_LEDS], ((i*i)+1));
+        }
+
+    }
+
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
+
+
+void colorPaletteSelection(color_t * selectedColor) {
+    displayColorPalette();
+    while (1) {
+        int8_t button = matrix_pressed_two();
+        if (button != no_button_pressed) {
+            *selectedColor = colors[button];
+            break;
+        }
+        Delay_Ms(200);
+    }
+    #ifdef DEBUG_VERBOSE
+    printf("Selected color: R:%d G:%d B:%d\n", selectedColor->r, selectedColor->g,
+        selectedColor->b);
+    #endif
+    flushCanvas();
+}
+
+/** 
+ * @brief Update pen status with selected color from variable bits
+ * @param bits Variable bits from a specific line run
+ * @param rVariable Current red color value
+ * @param gVariable Current green color value
+ * @param bVariable Current blue value
+ **/
+static void updatePendownColorFromBits(uint8_t bits, uint8_t rVariable, uint8_t gVariable, uint8_t bVariable) {
+    rvPendownColor.r = (bits & 0x04) ? 36 * rVariable : 0;
+    rvPendownColor.g = (bits & 0x02) ? 36 * gVariable : 0;
+    rvPendownColor.b = (bits & 0x01) ? 36 * bVariable : 0;
+}
+
+void red_screen(void) {
+    fill_color((color_t){.r = 100, .g = 0, .b = 0});
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
+
+void blue_screen(void) {
+    fill_color((color_t){.r = 0, .g = 0, .b = 100});
+    WS2812BSimpleSend(LED_PINS, (uint8_t *)led_array, NUM_LEDS * 3);
+}
