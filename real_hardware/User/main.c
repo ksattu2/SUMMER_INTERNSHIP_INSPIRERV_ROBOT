@@ -299,7 +299,7 @@ uint8_t normal_brightness_divisor = 10;// >0
 #define MOTOR_L1  GPIOv_from_PORT_PIN(GPIO_port_A, 1)
 
 // Software PWM period in microseconds. 1000us = 1kHz switching rate.
-#define MOTOR_PWM_PERIOD_US   100
+#define MOTOR_PWM_PERIOD_US   1000
 
 // 0-100. This is the car's cruising speed. Change it with
 // robot_set_speed() from anywhere (a menu, a button, etc).
